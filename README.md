@@ -45,35 +45,10 @@ python Skill_Lib/recluster_verbnet.py --source_dir skill_lib_results_oat --outpu
 # 获取规划器输出
 python Skill_Lib/get_planner_output.py --model_path Qwen/Qwen3-VL-4B-Instruct
 
-# 可视化
-python Skill_Lib/visualize_segmented.py
+# 训练action head
+python -m training.train_action_heads     --l1_class all     --head_type diffusion ("act" if wanna train action chunking transformer)     --epochs 64     --batch_size 64     --segmented_json segmented_demos.json
 
-# 对比学习训练
-python Skill_Lib/build_contrastive_skill_emb.py --source_dir skill_lib_results_full --output_dir skill_lib_results_contrastive
+# 测试
+python -m evaluation.evaluate     --head_type diffusion     --ckpt_dir ./checkpoints/       --n_eval 1 --task_ids 3 --video_dir eval_videos --save_video
 ```
 
-### Python 导入
-```python
-# 直接导入（推荐）
-from Skill_Lib.verbnet_utils import _parse_subtask_verbnet
-from Skill_Lib.skill_retriever import HierarchicalSkillRetriever
-from Skill_Lib.film_encoder import CLIPFiLMSkillEncoder
-
-# 旧路径仍可用（通过 shim 重定向）
-from libero.lifelong.test_skill_lib import _parse_subtask_verbnet
-```
-
-## 训练集成
-
-以下文件仍保留在 `libero/lifelong/` 中（因为它们与 LIBERO 训练框架深度耦合）：
-- `libero/lifelong/algos/skill_library.py` — SkillLibraryBuilder 算法
-- `libero/lifelong/datasets.py` — SkillLabeledVLDataset
-- `libero/lifelong/main_skill.py` — Hydra 训练入口
-- `libero/configs/config_skill.yaml` — 训练配置
-
-## 备份文件
-
-原始文件已备份为 `.bak` 后缀，确认无误后可删除：
-```bash
-rm -f *.bak libero/lifelong/*.bak libero/lifelong/models/modules/*.bak
-```
