@@ -1,0 +1,3146 @@
+"""
+Skill library builder for LIBERO-90.
+
+For every task in libero_90:
+  1. Render the initial observation (agentview + wrist camera).
+  2. Call QwenPlanner.get_subtasks() to produce atomic sub-task strings.
+  3. Encode each sub-task with Qwen tokenizer + input embedding layer
+     (mean-pooled token embeddings) to get a vector.
+
+Then cluster all sub-task vectors with distance-threshold agglomerative
+clustering (no fixed k – a new cluster is spawned whenever a point is
+farther than --dist_threshold from every existing centroid) and visualise:
+  - 2-D t-SNE scatter coloured by cluster, ★ marks each centroid representative.
+  - Per-cluster text summary with representative highlighted.
+  - Per-task cluster assignment JSON.
+
+
+
+Optional flags:
+  --task_suite_name   libero_90 (default)
+  --max_tasks         cap the number of tasks processed (default: all)
+  --seed              random seed (default: 7)
+  --device            cuda / cpu (default: cuda)
+  --dist_threshold    Euclidean distance threshold in L2-normalised Qwen-embed space
+                      (default 0.6; range ~0–2; smaller → more clusters)
+  --no_render         skip environment rendering; use blank images
+                      (useful for a quick embedding-only run)
+
+Encoder modes (--encoder_mode):
+  naive         Mean-pool raw input embeddings (V1 baseline, poor verb separation)
+  verb_aware    Verb one-hot + arg-only hidden-state pool (V1 advanced, hard-coded verbs)
+  sentence      Adaptive hidden-state pooling, no hard-coded verbs (V2)
+  sbert         Sentence-transformer model (V2)
+  oat           Object-Action-Target hierarchical clustering (V3 recommended)
+                Parses subtasks into (Action, Object, Target), clusters first by
+                action type (human prior), then by object handling style within
+                each action group. Distinguishes "轻拿轻放" vs "随便拿".
+
+Sentence encoder pooling strategies (--pool_mode, with --encoder_mode sentence):
+  last_token    Last non-padding hidden state (best default)
+  sif           Smooth Inverse Frequency weighted mean-pool + PC removal
+  mean          Plain hidden-state mean-pool (contextualised, but no IDF weighting)
+  hybrid        Concat(last_token, sif) with tunable --hybrid_weight
+"""
+
+import argparse
+import importlib.util
+import json
+import os
+import gc
+import sys
+from pathlib import Path
+from typing import Any
+
+import nltk
+from nltk import word_tokenize, pos_tag
+from nltk.stem import WordNetLemmatizer
+from nltk.corpus import verbnet as nltk_verbnet
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+import numpy as np
+import torch
+import matplotlib
+matplotlib.use("Agg")          # headless backend
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from PIL import Image
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import normalize
+
+# ---- resolve repo root & load local QwenPlanner -----------------------
+_SKILL_LIB_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SKILL_LIB_DIR.parent          # LIBERO-VLA/
+_DEFAULT_CACHE_DIR = _REPO_ROOT / "tmp"   # persistent subtask cache
+_QWEN_PLANNER_FILE = _SKILL_LIB_DIR / "QwenPlanner.py"
+_spec = importlib.util.spec_from_file_location("QwenPlanner", _QWEN_PLANNER_FILE)
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+QwenPlanner = _module.QwenPlanner
+
+from libero.libero import benchmark, get_libero_path
+from libero.libero.envs import OffScreenRenderEnv
+
+
+# -----------------------------------------------------------------------
+# Qwen text encoder (reuse planner tokenizer + embedding layer)
+# -----------------------------------------------------------------------
+
+# ---- Canonical verb set (order matters – used as one-hot index) ----------
+_VERB_LIST = [
+    "move to",
+    "pick up",
+    "place",
+    "open",
+    "close",
+    "turn on",
+    "turn off",
+]
+_NUM_VERBS = len(_VERB_LIST)
+
+
+def parse_verb(text: str) -> tuple[int, str, str]:
+    """Parse subtask text into (verb_index, verb_str, argument_str).
+
+    Returns verb_index=-1 if no known verb matched.
+    """
+    t = text.strip().rstrip(".")
+    lower = t.lower()
+    for idx, verb in enumerate(_VERB_LIST):
+        if lower.startswith(verb):
+            arg = t[len(verb):].strip()
+            return idx, verb, arg
+    return -1, "", t
+
+
+def build_verb_onehot(texts: list[str]) -> np.ndarray:
+    """Return (N, _NUM_VERBS) float32 one-hot matrix."""
+    oh = np.zeros((len(texts), _NUM_VERBS), dtype=np.float32)
+    for i, t in enumerate(texts):
+        idx, _, _ = parse_verb(t)
+        if idx >= 0:
+            oh[i, idx] = 1.0
+    return oh
+
+
+class NaiveTextEncoder:
+    """Naive subtask encoder (baseline).
+
+    Simple mean-pool of ALL token input embeddings (no transformer forward,
+    no verb separation, no one-hot).  This is the original V1 approach.
+
+    Produces (N, hidden_size) float32 vectors.
+    """
+
+    def __init__(self, planner: QwenPlanner):
+        self.tokenizer = planner.processor.tokenizer
+        self.embedder = planner.model.get_input_embeddings()
+        self.embed_device = self.embedder.weight.device
+        print(f"[NaiveTextEncoder] device={self.embed_device}, mode=input-embedding-mean-pool")
+
+    @torch.inference_mode()
+    def encode(self, texts: list[str], batch_size: int = 64, max_length: int = 128) -> np.ndarray:
+        """Return (N, hidden_size) float32 numpy array."""
+        all_vecs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            enc = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            input_ids = enc["input_ids"].to(self.embed_device)
+            attn_mask = enc["attention_mask"].to(self.embed_device)  # [B, T]
+
+            token_emb = self.embedder(input_ids)  # [B, T, D]
+
+            # Uniform mean-pool over all valid tokens
+            mask = attn_mask.unsqueeze(-1).float()  # [B, T, 1]
+            vecs = (token_emb * mask).sum(1) / mask.sum(1).clamp_min(1.0)
+            all_vecs.append(vecs.cpu().float().numpy())
+
+        return np.concatenate(all_vecs, axis=0)  # (N, hidden)
+
+
+class QwenTextEncoder:
+    """Verb-aware subtask encoder (advanced).
+
+    Produces per-subtask vectors by concatenating:
+      [verb_onehot * verb_weight,  arg_mean_pool_hidden_state]
+
+    The continuous part uses the Qwen transformer's hidden state at a
+    selectable layer (contextualized representations) instead of raw
+    input embeddings, so "bowl" in "Pick up the bowl" will differ from
+    "bowl" in "Place the bowl on the plate".  Verb tokens are masked
+    out of the continuous part – verb separation is handled solely by
+    the one-hot.
+    """
+
+    def __init__(self, planner: QwenPlanner, verb_weight: float = 3.0,
+                 verb_token_boost: float = 5.0,
+                 use_hidden_states: bool = True,
+                 hidden_layer: int = -1):
+        """
+        Args:
+            hidden_layer: Which transformer layer to pool from when
+                use_hidden_states=True.  -1 = last layer, positive int
+                selects that specific layer index (0-based; 0 = immediately
+                after input embeddings, 36 = last layer for 36-layer model).
+        """
+        self.planner = planner
+        self.model = planner.model
+        self.tokenizer = planner.processor.tokenizer
+        self.embedder = planner.model.get_input_embeddings()
+        self.embed_device = self.embedder.weight.device
+        self.verb_weight = verb_weight
+        self.verb_token_boost = verb_token_boost
+        self.use_hidden_states = use_hidden_states
+        self.hidden_layer = hidden_layer
+        # pre-tokenise each verb to know how many tokens it occupies
+        self._verb_token_lens: list[int] = []
+        for v in _VERB_LIST:
+            ids = self.tokenizer.encode(v, add_special_tokens=False)
+            self._verb_token_lens.append(len(ids))
+        mode = f"hidden-state(layer={hidden_layer})" if use_hidden_states else "input-embedding"
+        print(f"[QwenTextEncoder] device={self.embed_device}, mode={mode}, "
+              f"verb_weight={verb_weight}")
+
+    def _verb_token_count(self, text: str) -> int:
+        """Number of tokens occupied by the verb phrase in *text*."""
+        idx, _, _ = parse_verb(text)
+        if idx < 0:
+            return 0
+        return self._verb_token_lens[idx]
+
+    @torch.inference_mode()
+    def encode(self, texts: list[str], batch_size: int = 32, max_length: int = 128) -> np.ndarray:
+        """Return (N, _NUM_VERBS + hidden) float32 numpy array."""
+        # ---- one-hot part ----
+        verb_oh = build_verb_onehot(texts) * self.verb_weight  # (N, 7)
+
+        # ---- argument-only mean-pool of contextualised representations ----
+        all_vecs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            enc = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            input_ids = enc["input_ids"].to(self.embed_device)
+            attn_mask = enc["attention_mask"].to(self.embed_device)  # [B, T]
+
+            if self.use_hidden_states:
+                # Full transformer forward – contextualised representations
+                out = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                # hidden_states is a tuple of (num_layers+1) tensors
+                # index 0 = embedding output, 1..N = after each transformer layer
+                layer_idx = self.hidden_layer  # -1 = last
+                token_repr = out.hidden_states[layer_idx]  # [B, T, D]
+            else:
+                # Fallback: raw input embeddings (no context)
+                token_repr = self.embedder(input_ids)  # [B, T, D]
+
+            # Build per-token weight:
+            #   - verb tokens → weight 0 (excluded; one-hot handles verbs)
+            #   - argument tokens → weight 1.0
+            #   - padding → 0
+            weight = attn_mask.float().clone()  # [B, T]
+            for b_idx, txt in enumerate(batch):
+                n_verb_tok = self._verb_token_count(txt)
+                if n_verb_tok > 0:
+                    first_valid = int(attn_mask[b_idx].nonzero(as_tuple=True)[0][0].item())
+                    end = min(first_valid + n_verb_tok, weight.shape[1])
+                    weight[b_idx, first_valid:end] = 0  # zero out verb tokens
+
+            w = weight.unsqueeze(-1)  # [B, T, 1]
+            vecs = (token_repr * w).sum(1) / w.sum(1).clamp_min(1.0)
+            all_vecs.append(vecs.cpu().float().numpy())
+
+        emb = np.concatenate(all_vecs, axis=0)  # (N, hidden)
+        # Normalize continuous part to unit length BEFORE concat so that
+        # verb_weight directly controls the verb-vs-argument balance.
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        emb_normed = emb / norms
+        return np.concatenate([verb_oh, emb_normed], axis=1)  # (N, 7+hidden)
+
+
+class SentenceEncoder:
+    """Adaptive skill encoder using Qwen hidden states (v2).
+
+    Three pooling strategies — all fully automatic, NO hard-coded verb lists:
+
+      last_token  – Hidden state at the last non-padding position.
+                    For decoder-only instruction-tuned LLMs the last position
+                    naturally aggregates full-sentence meaning (action + objects).
+                    An optional prompt_prefix further primes the model.
+
+      sif         – Smooth Inverse Frequency weighted mean-pool.
+                    Token weight = α / (α + p(token)), where p(token) is the
+                    fraction of corpus texts containing that token.
+                    Automatically down-weights stop-words ("the", "of", "to")
+                    and up-weights discriminative tokens (specific verbs, objects).
+                    Optionally removes the first principal component (common
+                    discourse direction, per the SIF paper).
+
+      mean        – Plain mean-pool of hidden states (similar to naive encoder
+                    but uses *contextualised* hidden states instead of raw
+                    input embeddings).
+
+      hybrid      – Concatenation of normalised [last_token, sif] with a
+                    tunable weight ratio.  Best of both worlds.
+
+    All modes use full-transformer hidden states, so "bowl" in
+    "Pick up the bowl" will differ from "bowl" in "Place the bowl on the plate".
+
+    Extensible by design:
+      • Works with any subtask vocabulary — new verbs, nouns, prepositions.
+      • No task-suite-specific constants.
+      • Compatible with Qwen2.5-VL and Qwen3-VL.
+    """
+
+    def __init__(
+        self,
+        planner,
+        pool_mode: str = "last_token",   # last_token | sif | mean | hybrid
+        hidden_layer: int = -1,
+        sif_alpha: float = 1e-3,
+        remove_pc: bool = True,
+        prompt_prefix: str = "Skill: ",
+        hybrid_weight: float = 0.5,      # blend ratio for last_token in hybrid
+    ):
+        self.model = planner.model
+        self.tokenizer = planner.processor.tokenizer
+        self.embed_device = planner.model.get_input_embeddings().weight.device
+        self.pool_mode = pool_mode
+        self.hidden_layer = hidden_layer
+        self.sif_alpha = sif_alpha
+        self.remove_pc = remove_pc
+        self.prompt_prefix = prompt_prefix
+        self.hybrid_weight = hybrid_weight
+        print(
+            f"[SentenceEncoder] mode={pool_mode}, layer={hidden_layer}, "
+            f"prefix='{prompt_prefix}', sif_α={sif_alpha}, "
+            f"remove_pc={remove_pc}, hybrid_w={hybrid_weight}"
+        )
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _compute_token_freqs(
+        self, texts: list[str], max_length: int = 128
+    ) -> dict[int, float]:
+        """Document frequency for each token id (fraction of texts containing it)."""
+        doc_count: dict[int, int] = {}
+        n = len(texts)
+        for t in texts:
+            ids = self.tokenizer.encode(
+                t, add_special_tokens=False, truncation=True, max_length=max_length
+            )
+            for tid in set(ids):
+                doc_count[tid] = doc_count.get(tid, 0) + 1
+        return {tid: cnt / n for tid, cnt in doc_count.items()}
+
+    @torch.inference_mode()
+    def _forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run model forward → hidden states at the selected layer."""
+        out = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        return out.hidden_states[self.hidden_layer]  # [B, T, D]
+
+    @staticmethod
+    def _last_token_pool(
+        hidden: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Hidden state at the last non-padding position for each sample."""
+        seq_lens = attention_mask.sum(dim=1).long()   # [B]
+        last_idx = (seq_lens - 1).clamp_min(0)        # [B]
+        B = hidden.shape[0]
+        return hidden[torch.arange(B, device=hidden.device), last_idx]
+
+    @staticmethod
+    def _remove_first_pc(emb: np.ndarray) -> np.ndarray:
+        """Subtract projection onto the first principal component (SIF trick)."""
+        mean = emb.mean(axis=0, keepdims=True)
+        centered = emb - mean
+        _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+        pc1 = Vt[0:1]                            # (1, D)
+        emb = emb - (centered @ pc1.T) @ pc1     # (N, D)
+        return emb
+
+    # ------------------------------------------------------------------
+    # main encode
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def encode(
+        self,
+        texts: list[str],
+        batch_size: int = 32,
+        max_length: int = 128,
+    ) -> np.ndarray:
+        """Return (N, D) float32 numpy array."""
+
+        need_sif = self.pool_mode in ("sif", "hybrid")
+        need_last = self.pool_mode in ("last_token", "hybrid")
+        need_mean = self.pool_mode == "mean"
+
+        # Pre-compute token frequencies if needed
+        token_freqs: dict[int, float] | None = None
+        if need_sif:
+            token_freqs = self._compute_token_freqs(texts, max_length)
+
+        prefixed = [self.prompt_prefix + t for t in texts]
+
+        parts_last: list[np.ndarray] = []
+        parts_sif:  list[np.ndarray] = []
+        parts_mean: list[np.ndarray] = []
+
+        for start in range(0, len(prefixed), batch_size):
+            batch = prefixed[start : start + batch_size]
+            enc = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            input_ids = enc["input_ids"].to(self.embed_device)
+            attn_mask = enc["attention_mask"].to(self.embed_device)
+
+            hidden = self._forward_hidden(input_ids, attn_mask)  # [B, T, D]
+
+            if need_last:
+                v = self._last_token_pool(hidden, attn_mask)  # [B, D]
+                parts_last.append(v.cpu().float().numpy())
+
+            if need_sif:
+                # Vectorised SIF weight: α / (α + p(token))
+                ids_flat = input_ids.reshape(-1).cpu().tolist()
+                freqs = torch.tensor(
+                    [token_freqs.get(tid, 0.0) for tid in ids_flat],
+                    dtype=torch.float32,
+                )
+                sif_w = (
+                    (self.sif_alpha / (self.sif_alpha + freqs))
+                    .reshape(input_ids.shape)
+                    .to(self.embed_device)
+                )
+                sif_w = sif_w * attn_mask.float()
+                w = sif_w.unsqueeze(-1)                                # [B, T, 1]
+                v = (hidden * w).sum(1) / w.sum(1).clamp_min(1.0)     # [B, D]
+                parts_sif.append(v.cpu().float().numpy())
+
+            if need_mean:
+                w = attn_mask.float().unsqueeze(-1)
+                v = (hidden * w).sum(1) / w.sum(1).clamp_min(1.0)
+                parts_mean.append(v.cpu().float().numpy())
+
+        # ---- assemble final embedding ----
+        if self.pool_mode == "last_token":
+            emb = np.concatenate(parts_last, axis=0)
+
+        elif self.pool_mode == "sif":
+            emb = np.concatenate(parts_sif, axis=0)
+            if self.remove_pc and emb.shape[0] > 1:
+                emb = self._remove_first_pc(emb)
+
+        elif self.pool_mode == "mean":
+            emb = np.concatenate(parts_mean, axis=0)
+
+        elif self.pool_mode == "hybrid":
+            last_emb = np.concatenate(parts_last, axis=0)
+            sif_emb  = np.concatenate(parts_sif, axis=0)
+            if self.remove_pc and sif_emb.shape[0] > 1:
+                sif_emb = self._remove_first_pc(sif_emb)
+            # L2-normalise each stream, then weight & concat
+            last_n = normalize(last_emb)
+            sif_n  = normalize(sif_emb)
+            a = self.hybrid_weight
+            emb = np.concatenate([a * last_n, (1 - a) * sif_n], axis=1)
+
+        else:
+            raise ValueError(f"Unknown pool_mode: {self.pool_mode}")
+
+        return emb
+
+
+class SBERTEncoder:
+    """Skill encoder using a dedicated sentence embedding model.
+
+    Uses a lightweight sentence-transformer (e.g. all-MiniLM-L6-v2, gte-small)
+    that is specifically trained for semantic similarity.  Unlike LLM hidden
+    states, these models produce embeddings where cosine distance directly
+    correlates with meaning difference — "Pick up the bowl" and "Place the bowl"
+    will be far apart because the models are contrastively trained.
+
+    Advantages:
+      • Zero hard-coded verb lists — works with any action vocabulary.
+      • Tiny model footprint (~80-100 MB) — can co-exist with the Qwen planner.
+      • Produces well-separated embeddings out of the box.
+      • Extensible: swap in any HuggingFace sentence-transformer model.
+
+    The encoding is done on CPU by default (fast enough for <1000 sentences)
+    to avoid competing for GPU memory with the Qwen planner.
+
+    Optional prompt_prefix (like "Skill: ") can be prepended to prime the
+    encoder for instruction-style text, following the E5/GTE convention.
+
+    verb_boost (float):
+        When > 0, an auxiliary embedding of the automatically extracted verb
+        phrase is concatenated (weighted) to the main embedding.
+        This amplifies action differentiation without any hard-coded list.
+        verb_boost = 0  → pure semantic embedding (default)
+        verb_boost = 1  → verb-phrase embedding has equal weight to main
+        Set to ~0.5–1.0 if "Move to X" and "Pick up X" are too close.
+    """
+
+    def __init__(
+        self,
+        sbert_model: str = "all-MiniLM-L6-v2",
+        prompt_prefix: str = "",
+        device: str = "cpu",
+        verb_boost: float = 0.0,
+    ):
+        from sentence_transformers import SentenceTransformer
+
+        self.model = SentenceTransformer(sbert_model, device=device)
+        self.prompt_prefix = prompt_prefix
+        self.verb_boost = verb_boost
+        dim = self.model.get_sentence_embedding_dimension()
+        print(
+            f"[SBERTEncoder] model={sbert_model}, dim={dim}, "
+            f"prefix='{prompt_prefix}', verb_boost={verb_boost}, device={device}"
+        )
+
+    @staticmethod
+    def _extract_verb_phrase(text: str) -> str:
+        """Auto-extract the leading verb phrase from a subtask string.
+
+        Splits at the first article/preposition boundary:
+          "Pick up the red mug from the table" → "Pick up"
+          "Place the bowl on the plate"        → "Place"
+          "Turn on the stove"                  → "Turn on"
+          "Move to the basket"                 → "Move to"
+          "Grasp the handle"                   → "Grasp"
+
+        No hard-coded verb list — works with any English imperative.
+        """
+        # Split tokens; stop at first article/prep which starts the object
+        stop_words = {
+            "the", "a", "an", "this", "that", "its",
+        }
+        tokens = text.strip().rstrip(".").split()
+        verb_tokens = []
+        for tok in tokens:
+            if tok.lower() in stop_words:
+                break
+            verb_tokens.append(tok)
+        return " ".join(verb_tokens) if verb_tokens else text.split()[0]
+
+    def encode(
+        self,
+        texts: list[str],
+        batch_size: int = 128,
+        max_length: int = 128,
+    ) -> np.ndarray:
+        """Return (N, D) or (N, 2D) float32 numpy array of sentence embeddings."""
+        prefixed = [self.prompt_prefix + t for t in texts]
+        main_emb = self.model.encode(
+            prefixed,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        ).astype(np.float32)
+
+        if self.verb_boost <= 0:
+            return main_emb
+
+        # Extract verb phrases and encode them separately
+        verb_phrases = [self._extract_verb_phrase(t) for t in texts]
+        verb_emb = self.model.encode(
+            verb_phrases,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        ).astype(np.float32)
+
+        # L2-normalise each stream, then weight & concat
+        main_n = normalize(main_emb)
+        verb_n = normalize(verb_emb)
+        return np.concatenate([main_n, self.verb_boost * verb_n], axis=1)
+
+
+# -----------------------------------------------------------------------
+# OAT (Object-Action-Target) hierarchical skill encoder
+# -----------------------------------------------------------------------
+
+# Canonical action taxonomy — human prior knowledge for first-level grouping.
+# Keys are canonical action IDs; values list all verb phrases that map to them.
+# This is the core "human prior" that helps the model distinguish skill types.
+_ACTION_TAXONOMY: dict[str, list[str]] = {
+    "approach":   ["move to", "go to", "navigate to", "reach"],
+    "grasp":      ["pick up", "grasp", "grab", "lift"],
+    "place":      ["place", "put", "set down", "drop", "lay"],
+    "open":       ["open", "pull open"],
+    "close":      ["close", "push closed", "shut"],
+    "activate":   ["turn on", "switch on"],
+    "deactivate": ["turn off", "switch off"],
+    "pull":       ["pull"],
+    "push":       ["push"],
+}
+
+# Invert: verb phrase -> canonical action ID (longest match first)
+_VERB_TO_ACTION: list[tuple[str, str]] = []
+for _act_id, _phrases in _ACTION_TAXONOMY.items():
+    for _phrase in _phrases:
+        _VERB_TO_ACTION.append((_phrase.lower(), _act_id))
+_VERB_TO_ACTION.sort(key=lambda x: -len(x[0]))  # longest match first
+
+# Object handling-style priors — secondary grouping within each action.
+# Maps object keywords to a handling category that reflects how they should
+# be physically manipulated (the "轻拿轻放 vs 随便拿" distinction).
+_OBJECT_HANDLING_PRIORS: dict[str, list[str]] = {
+    "container":  ["bowl", "mug", "cup", "pot", "pan", "basket", "tray"],
+    "bottle":     ["bottle", "carton", "can"],
+    "box":        ["box", "container", "pudding", "butter", "cheese", "soup"],
+    "flat":       ["book", "plate"],
+    "furniture":  ["drawer", "cabinet", "shelf", "door", "stove", "table"],
+    "cookware":   ["frying pan", "moka pot", "kettle"],
+}
+
+# Invert: keyword -> handling category (longest match first for multi-word)
+_OBJ_KEYWORD_TO_HANDLING: list[tuple[str, str]] = []
+for _cat, _keywords in _OBJECT_HANDLING_PRIORS.items():
+    for _kw in _keywords:
+        _OBJ_KEYWORD_TO_HANDLING.append((_kw.lower(), _cat))
+_OBJ_KEYWORD_TO_HANDLING.sort(key=lambda x: -len(x[0]))
+
+# Target/destination priors — where things are being placed
+_TARGET_PRIORS: dict[str, list[str]] = {
+    "surface":    ["on", "on top of", "on the table", "on the stove"],
+    "inside":     ["in", "in the drawer", "in the basket", "in the tray",
+                   "in the compartment"],
+    "under":      ["under", "below", "beneath"],
+    "stacking":   ["on top of the", "on the back", "on the front"],
+}
+
+
+def parse_oat(text: str) -> dict[str, str]:
+    """Parse a subtask string into an (Action, Object, Target) triple.
+
+    Returns a dict with keys: action, action_phrase, object, target,
+    object_handling, target_type.
+
+    Examples:
+        "pick up the red mug"
+          -> action='grasp', object='red mug', target='',
+             object_handling='container'
+        "place the bowl on the plate"
+          -> action='place', object='bowl', target='on the plate',
+             object_handling='container', target_type='surface'
+        "move to the cabinet"
+          -> action='approach', object='', target='cabinet',
+             object_handling='unknown', target_type='unknown'
+    """
+    t = text.strip().rstrip(".")
+    lower = t.lower()
+
+    # 1) Match canonical action
+    action_id = "unknown"
+    action_phrase = ""
+    remainder = lower
+    for phrase, act_id in _VERB_TO_ACTION:
+        if lower.startswith(phrase):
+            action_id = act_id
+            action_phrase = phrase
+            remainder = lower[len(phrase):].strip()
+            break
+
+    # 2) Strip leading articles
+    for art in ("the ", "a ", "an "):
+        if remainder.startswith(art):
+            remainder = remainder[len(art):]
+            break
+
+    # 3) Split into object and target at preposition boundaries
+    # For "place" actions: object is before the prep, target is after
+    # For "pick up" / "grasp": everything is the object
+    # For "move to": everything is the target
+    obj_str = ""
+    target_str = ""
+
+    if action_id == "approach":
+        # "move to the cabinet" -> target = cabinet
+        target_str = remainder
+    elif action_id in ("grasp",):
+        # "pick up the red mug" -> object = red mug
+        # But might have "from the table" suffix
+        prep_markers = [" from ", " off ", " out of "]
+        obj_str = remainder
+        for pm in prep_markers:
+            idx = remainder.find(pm)
+            if idx >= 0:
+                obj_str = remainder[:idx].strip()
+                target_str = remainder[idx + len(pm):].strip()
+                break
+    elif action_id in ("place",):
+        # "place the bowl on the plate" -> object = bowl, target = on the plate
+        prep_markers = [" on top of ", " in the ", " on the ", " under the ",
+                        " in ", " on ", " under ", " into "]
+        obj_str = remainder
+        for pm in prep_markers:
+            idx = remainder.find(pm)
+            if idx >= 0:
+                obj_str = remainder[:idx].strip()
+                target_str = remainder[idx:].strip()
+                break
+    else:
+        # open/close/activate etc. — the whole thing is the target/object
+        obj_str = remainder
+        target_str = ""
+
+    # 4) Classify object handling style
+    obj_handling = "unknown"
+    obj_lower = obj_str.lower() if obj_str else ""
+    # Also check target for approach actions
+    check_str = obj_lower if obj_lower else (target_str.lower() if target_str else "")
+    for kw, cat in _OBJ_KEYWORD_TO_HANDLING:
+        if kw in check_str:
+            obj_handling = cat
+            break
+
+    # 5) Classify target type
+    target_type = "unknown"
+    tgt_lower = target_str.lower() if target_str else ""
+    if tgt_lower:
+        if any(kw in tgt_lower for kw in ["in the ", "in a ", "inside"]):
+            target_type = "inside"
+        elif any(kw in tgt_lower for kw in ["on top of"]):
+            target_type = "stacking"
+        elif any(kw in tgt_lower for kw in ["under ", "below ", "beneath "]):
+            target_type = "under"
+        elif any(kw in tgt_lower for kw in ["on the ", "on a "]):
+            target_type = "surface"
+
+    return {
+        "action": action_id,
+        "action_phrase": action_phrase,
+        "object": obj_str,
+        "target": target_str,
+        "object_handling": obj_handling,
+        "target_type": target_type,
+    }
+
+
+class OATEncoder:
+    """Object-Action-Target hierarchical skill encoder.
+
+    First-principles approach: the same verb (e.g. "pick up") applied to
+    different objects may require fundamentally different motor behaviours.
+    Picking up a bowl (rigid container, needs orientation control) differs
+    from picking up a book (flat, simple top-down grasp).
+
+    Encoding strategy:
+      1. Parse subtask -> (action, object, target) using rule-based parser
+         with human-defined action taxonomy (the "prior knowledge").
+      2. Action component: one-hot vector over canonical action categories
+         (scaled by action_weight) — deterministic, reflects human priors.
+      3. Object component: semantic embedding of the object noun phrase,
+         PLUS an optional one-hot handling-style prior (container/bottle/
+         box/flat/furniture/cookware) weighted by handling_weight.
+      4. Target component: semantic embedding of the target phrase,
+         PLUS an optional one-hot target-type prior (surface/inside/
+         under/stacking) weighted by target_weight.
+
+    The final embedding = concat(action_onehot, object_emb, target_emb,
+    handling_onehot, target_type_onehot), designed so that:
+      - Different actions are well-separated (human prior)
+      - Same action + different object types are sub-separated
+      - Same action + same object + different targets are further separated
+
+    This is specifically designed for hierarchical clustering where
+    Level-1 = action type, Level-2 = object handling style.
+    """
+
+    _NUM_ACTIONS = len(_ACTION_TAXONOMY)
+    _ACTION_IDS = sorted(_ACTION_TAXONOMY.keys())
+
+    _NUM_HANDLING = len(_OBJECT_HANDLING_PRIORS) + 1   # +1 for "unknown"
+    _HANDLING_IDS = sorted(_OBJECT_HANDLING_PRIORS.keys()) + ["unknown"]
+
+    _NUM_TARGET_TYPES = 5   # surface, inside, under, stacking, unknown
+    _TARGET_TYPE_IDS = ["surface", "inside", "under", "stacking", "unknown"]
+
+    def __init__(
+        self,
+        sbert_model: str = "all-MiniLM-L6-v2",
+        device: str = "cpu",
+        action_weight: float = 4.0,
+        handling_weight: float = 2.0,
+        target_type_weight: float = 1.0,
+        object_weight: float = 1.0,
+        target_weight: float = 0.5,
+    ):
+        """
+        Args:
+            action_weight:       Scale for action one-hot (higher -> stronger
+                                 first-level separation by verb type).
+            handling_weight:     Scale for object handling-style one-hot
+                                 (the "轻拿轻放" prior).
+            target_type_weight:  Scale for target-type one-hot.
+            object_weight:       Scale for object semantic embedding.
+            target_weight:       Scale for target semantic embedding.
+        """
+        from sentence_transformers import SentenceTransformer
+
+        self.sbert = SentenceTransformer(sbert_model, device=device)
+        self.action_weight = action_weight
+        self.handling_weight = handling_weight
+        self.target_type_weight = target_type_weight
+        self.object_weight = object_weight
+        self.target_weight = target_weight
+        dim = self.sbert.get_sentence_embedding_dimension()
+        print(
+            f"[OATEncoder] model={sbert_model}, dim={dim}, "
+            f"action_w={action_weight}, handling_w={handling_weight}, "
+            f"target_type_w={target_type_weight}, "
+            f"object_w={object_weight}, target_w={target_weight}"
+        )
+
+    def _action_onehot(self, action_id: str) -> np.ndarray:
+        vec = np.zeros(self._NUM_ACTIONS, dtype=np.float32)
+        if action_id in self._ACTION_IDS:
+            vec[self._ACTION_IDS.index(action_id)] = 1.0
+        return vec
+
+    def _handling_onehot(self, handling: str) -> np.ndarray:
+        vec = np.zeros(self._NUM_HANDLING, dtype=np.float32)
+        if handling in self._HANDLING_IDS:
+            vec[self._HANDLING_IDS.index(handling)] = 1.0
+        else:
+            vec[self._HANDLING_IDS.index("unknown")] = 1.0
+        return vec
+
+    def _target_type_onehot(self, target_type: str) -> np.ndarray:
+        vec = np.zeros(self._NUM_TARGET_TYPES, dtype=np.float32)
+        if target_type in self._TARGET_TYPE_IDS:
+            vec[self._TARGET_TYPE_IDS.index(target_type)] = 1.0
+        else:
+            vec[self._TARGET_TYPE_IDS.index("unknown")] = 1.0
+        return vec
+
+    def encode(
+        self,
+        texts: list[str],
+        batch_size: int = 128,
+        max_length: int = 128,
+    ) -> np.ndarray:
+        """Return (N, D_total) float32 numpy array.
+
+        D_total = NUM_ACTIONS + NUM_HANDLING + NUM_TARGET_TYPES + 2 * sbert_dim
+        """
+        # Parse all subtasks
+        parses = [parse_oat(t) for t in texts]
+
+        # 1) Action one-hot
+        action_oh = np.stack(
+            [self._action_onehot(p["action"]) for p in parses]
+        ) * self.action_weight
+
+        # 2) Handling style one-hot
+        handling_oh = np.stack(
+            [self._handling_onehot(p["object_handling"]) for p in parses]
+        ) * self.handling_weight
+
+        # 3) Target type one-hot
+        ttype_oh = np.stack(
+            [self._target_type_onehot(p["target_type"]) for p in parses]
+        ) * self.target_type_weight
+
+        # 4) Object semantic embeddings (SBERT)
+        obj_texts = [p["object"] if p["object"] else "none" for p in parses]
+        obj_emb = self.sbert.encode(
+            obj_texts, batch_size=batch_size, show_progress_bar=False,
+            convert_to_numpy=True, normalize_embeddings=False,
+        ).astype(np.float32)
+        obj_emb = normalize(obj_emb) * self.object_weight
+
+        # 5) Target semantic embeddings (SBERT)
+        tgt_texts = [p["target"] if p["target"] else "none" for p in parses]
+        tgt_emb = self.sbert.encode(
+            tgt_texts, batch_size=batch_size, show_progress_bar=False,
+            convert_to_numpy=True, normalize_embeddings=False,
+        ).astype(np.float32)
+        tgt_emb = normalize(tgt_emb) * self.target_weight
+
+        return np.concatenate(
+            [action_oh, handling_oh, ttype_oh, obj_emb, tgt_emb], axis=1
+        )
+
+
+def oat_hierarchical_cluster(
+    subtask_texts: list[str],
+    task_ids: list[int],
+    embeddings: np.ndarray,
+    dist_threshold: float,
+    output_dir: Path,
+    task_languages: list[str],
+):
+    """Two-level hierarchical clustering following the OAT framework.
+
+    Level 1: Deterministic grouping by canonical action type (human prior).
+    Level 2: Within each action group, agglomerative clustering on the
+             object+target part of the embedding to discover handling styles.
+
+    Produces globally unique cluster IDs: "action_type.sub_cluster_id"
+    (e.g. "grasp.0" = pick up containers, "grasp.1" = pick up flat objects).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse all subtasks
+    parses = [parse_oat(t) for t in subtask_texts]
+    action_groups: dict[str, list[int]] = {}  # action_id -> list of indices
+    for i, p in enumerate(parses):
+        act = p["action"]
+        action_groups.setdefault(act, []).append(i)
+
+    norm_emb = normalize(embeddings)
+
+    # Global label array: each entry is "action.sub_cluster"
+    global_labels = [""] * len(subtask_texts)
+    global_cluster_id = 0
+    cluster_id_map: dict[str, int] = {}  # "action.sub" -> global int
+    center_texts: dict[int, str] = {}
+    center_indices: dict[int, int] = {}
+
+    print(f"\n[OAT] Hierarchical clustering: {len(action_groups)} action groups")
+    for action_id in sorted(action_groups.keys()):
+        indices = action_groups[action_id]
+        print(f"  Action '{action_id}': {len(indices)} subtasks")
+
+        if len(indices) <= 1:
+            # Singleton group -> one cluster
+            label_str = f"{action_id}.0"
+            cid = global_cluster_id
+            cluster_id_map[label_str] = cid
+            global_cluster_id += 1
+            for idx in indices:
+                global_labels[idx] = label_str
+            center_indices[cid] = indices[0]
+            center_texts[cid] = subtask_texts[indices[0]]
+            continue
+
+        # Extract sub-embeddings for this action group
+        sub_emb = norm_emb[indices]
+
+        # Level-2 agglomerative clustering within this action group
+        if len(indices) <= 2:
+            # Too few for clustering -> one sub-cluster
+            sub_labels = np.zeros(len(indices), dtype=int)
+        else:
+            agg = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=dist_threshold,
+                linkage="average",
+                metric="euclidean",
+            )
+            sub_labels = agg.fit_predict(sub_emb)
+
+        n_sub = int(sub_labels.max()) + 1
+        print(f"    -> {n_sub} sub-clusters (threshold={dist_threshold})")
+
+        for sub_id in range(n_sub):
+            label_str = f"{action_id}.{sub_id}"
+            cid = global_cluster_id
+            cluster_id_map[label_str] = cid
+            global_cluster_id += 1
+
+            sub_mask = np.where(sub_labels == sub_id)[0]
+            sub_global_indices = [indices[j] for j in sub_mask]
+
+            # Find representative (closest to sub-cluster centroid)
+            sub_sub_emb = norm_emb[sub_global_indices]
+            centroid = sub_sub_emb.mean(axis=0)
+            dists = np.linalg.norm(sub_sub_emb - centroid, axis=1)
+            rep_local = int(np.argmin(dists))
+            rep_global = sub_global_indices[rep_local]
+
+            center_indices[cid] = rep_global
+            center_texts[cid] = subtask_texts[rep_global]
+
+            for gi in sub_global_indices:
+                global_labels[gi] = label_str
+
+            # Show parsing details for this sub-cluster
+            handling_counts: dict[str, int] = {}
+            for gi in sub_global_indices:
+                h = parses[gi]["object_handling"]
+                handling_counts[h] = handling_counts.get(h, 0) + 1
+            handling_str = ", ".join(
+                f"{k}:{v}" for k, v in sorted(handling_counts.items(),
+                                               key=lambda x: -x[1])
+            )
+            print(f"      {label_str} (n={len(sub_global_indices)}): "
+                  f"★ {center_texts[cid]}  [handling: {handling_str}]")
+
+    n_clusters = global_cluster_id
+    # Convert label strings to int array for compatibility
+    int_labels = np.array(
+        [cluster_id_map[gl] for gl in global_labels], dtype=int
+    )
+
+    # ---- t-SNE ----
+    print("[OAT] Running t-SNE for 2-D projection ...")
+    perplexity = min(30, len(subtask_texts) - 1)
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42,
+                max_iter=1000)
+    xy = tsne.fit_transform(embeddings)
+
+    # ---- scatter plot with action-type colour families ----
+    # Each action type gets a base hue; sub-clusters get brightness variations
+    action_hues = {}
+    hue_step = 1.0 / max(len(action_groups), 1)
+    for i, act in enumerate(sorted(action_groups.keys())):
+        action_hues[act] = i * hue_step
+
+    import colorsys
+
+    def _oat_color(label_str):
+        parts = label_str.split(".")
+        act = parts[0] if parts else "unknown"
+        sub = int(parts[1]) if len(parts) > 1 else 0
+        hue = action_hues.get(act, 0.0)
+        # Vary saturation/lightness by sub-cluster
+        sat = max(0.3, 1.0 - sub * 0.15)
+        lit = min(0.85, 0.45 + sub * 0.1)
+        r, g, b = colorsys.hls_to_rgb(hue, lit, sat)
+        return (r, g, b, 0.8)
+
+    colors = [_oat_color(gl) for gl in global_labels]
+    fig, ax = plt.subplots(figsize=(22, 15))
+    ax.scatter(xy[:, 0], xy[:, 1], c=colors, s=18, alpha=0.60,
+               linewidths=0, zorder=2)
+
+    # Highlight centroids
+    for cid, idx in center_indices.items():
+        cx, cy = xy[idx]
+        label_str = global_labels[idx]
+        color = _oat_color(label_str)
+        ax.scatter(cx, cy, c=[color], s=280, marker="*",
+                   edgecolors="black", linewidths=0.6, zorder=5)
+        display_text = center_texts[cid]
+        if len(display_text) > 30:
+            display_text = display_text[:28] + "..."
+        ax.annotate(
+            f"{label_str}: {display_text}",
+            xy=(cx, cy), xytext=(6, 4), textcoords="offset points",
+            fontsize=10.0, color="black",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color[:3],
+                      alpha=0.85, linewidth=0.8),
+            zorder=6,
+        )
+
+    # Legend grouped by action
+    patches = []
+    for act in sorted(action_groups.keys()):
+        for label_str, cid in sorted(cluster_id_map.items()):
+            if label_str.startswith(act + "."):
+                rep = center_texts[cid][:40]
+                if len(center_texts[cid]) > 40:
+                    rep += "..."
+                patches.append(mpatches.Patch(
+                    color=_oat_color(label_str),
+                    label=f"{label_str}: {rep}",
+                ))
+
+    ax.legend(handles=patches, bbox_to_anchor=(1.01, 1), loc="upper left",
+              fontsize=11.0, title=f"OAT clusters - k={n_clusters}",
+              title_fontsize=14)
+    ax.set_title(
+        f"OAT Hierarchical Skill Library - LIBERO-90\n"
+        f"Level-1: {len(action_groups)} action types x "
+        f"Level-2: object/target sub-clusters (threshold={dist_threshold})\n"
+        f"Total: {n_clusters} skill clusters  * = representative"
+    )
+    ax.set_xlabel("t-SNE dim 1")
+    ax.set_ylabel("t-SNE dim 2")
+    plt.tight_layout()
+    scatter_path = output_dir / "skill_clusters_tsne.png"
+    fig.savefig(scatter_path, dpi=200)
+    plt.close(fig)
+    print(f"[OAT] Scatter plot saved -> {scatter_path}")
+
+    # ---- text summary ----
+    cluster_info: dict[str, list[str]] = {}
+    for text, gl in zip(subtask_texts, global_labels):
+        cluster_info.setdefault(gl, []).append(text)
+
+    summary_lines = []
+    print(f"\n[OAT] {n_clusters} skill clusters found:")
+    for act in sorted(action_groups.keys()):
+        summary_lines.append(f"\n{'#'*70}")
+        summary_lines.append(f"# ACTION GROUP: {act.upper()}")
+        summary_lines.append(f"{'#'*70}")
+        for label_str in sorted(cluster_id_map.keys()):
+            if not label_str.startswith(act + "."):
+                continue
+            cid = cluster_id_map[label_str]
+            members = cluster_info.get(label_str, [])
+            rep = center_texts[cid]
+
+            # Aggregate parse info
+            handling_counts: dict[str, int] = {}
+            target_type_counts: dict[str, int] = {}
+            for m in members:
+                p = parse_oat(m)
+                handling_counts[p["object_handling"]] = \
+                    handling_counts.get(p["object_handling"], 0) + 1
+                if p["target_type"] != "unknown":
+                    target_type_counts[p["target_type"]] = \
+                        target_type_counts.get(p["target_type"], 0) + 1
+
+            summary_lines.append(f"\n{'='*60}")
+            summary_lines.append(
+                f"Cluster {label_str}  ({len(members)} subtasks)"
+            )
+            summary_lines.append(f"  * Representative: {rep}")
+            summary_lines.append(
+                f"  Object handling: "
+                + ", ".join(f"{k}({v})" for k, v in
+                            sorted(handling_counts.items(), key=lambda x: -x[1]))
+            )
+            if target_type_counts:
+                summary_lines.append(
+                    f"  Target types: "
+                    + ", ".join(f"{k}({v})" for k, v in
+                                sorted(target_type_counts.items(),
+                                       key=lambda x: -x[1]))
+                )
+            summary_lines.append(f"{'='*60}")
+            print(f"  {label_str:20s} * {rep}")
+
+            seen = set()
+            deduped = []
+            for m in members:
+                key = m.lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(m)
+            for m in deduped[:30]:
+                p = parse_oat(m)
+                prefix = "  *" if m == rep else "  -"
+                summary_lines.append(
+                    f"{prefix} {m}  "
+                    f"[obj={p['object']}, handling={p['object_handling']}, "
+                    f"target={p['target']}, target_type={p['target_type']}]"
+                )
+            if len(deduped) > 30:
+                summary_lines.append(
+                    f"  ... ({len(deduped) - 30} more unique entries)"
+                )
+
+    summary_text = "\n".join(summary_lines)
+    summary_path = output_dir / "skill_clusters_summary.txt"
+    summary_path.write_text(summary_text, encoding="utf-8")
+    print(f"\n[OAT] Text summary saved -> {summary_path}")
+
+    # ---- OAT parse details JSON ----
+    oat_parses = []
+    for text, tid, gl in zip(subtask_texts, task_ids, global_labels):
+        p = parse_oat(text)
+        cid = cluster_id_map[gl]
+        oat_parses.append({
+            "subtask": text,
+            "task_id": tid,
+            "task_language": task_languages[tid],
+            "action": p["action"],
+            "action_phrase": p["action_phrase"],
+            "object": p["object"],
+            "object_handling": p["object_handling"],
+            "target": p["target"],
+            "target_type": p["target_type"],
+            "cluster": gl,
+            "cluster_int": cid,
+            "cluster_representative": center_texts[cid],
+            "is_representative": (text == center_texts[cid]),
+        })
+    json_path = output_dir / "skill_lib_records.json"
+    json_path.write_text(
+        json.dumps(oat_parses, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"[OAT] Detailed records saved -> {json_path}")
+
+    # ---- per-task cluster assignment JSON ----
+    task_cluster_map: dict[int, dict] = {}
+    for text, tid, gl in zip(subtask_texts, task_ids, global_labels):
+        cid = cluster_id_map[gl]
+        if tid not in task_cluster_map:
+            task_cluster_map[tid] = {
+                "task_id": tid,
+                "task_language": task_languages[tid],
+                "subtasks": [],
+            }
+        task_cluster_map[tid]["subtasks"].append({
+            "text": text,
+            "cluster": gl,
+            "cluster_int": cid,
+            "cluster_representative": center_texts[cid],
+            "is_representative": (text == center_texts[cid]),
+        })
+    task_list = [task_cluster_map[tid] for tid in sorted(task_cluster_map)]
+    task_json_path = output_dir / "task_cluster_assignments.json"
+    task_json_path.write_text(
+        json.dumps(task_list, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"[OAT] Per-task assignments saved -> {task_json_path}")
+
+    # ---- cluster representatives ----
+    rep_map = {}
+    for label_str, cid in sorted(cluster_id_map.items()):
+        rep_map[label_str] = {
+            "representative": center_texts[cid],
+            "cluster_int": cid,
+            "action": label_str.split(".")[0],
+        }
+    rep_path = output_dir / "cluster_representatives.json"
+    rep_path.write_text(
+        json.dumps(rep_map, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"[OAT] Representatives saved -> {rep_path}")
+
+    return int_labels, cluster_info
+
+
+
+# -----------------------------------------------------------------------
+# VerbNet-style two-level hierarchy — imported from shared utility
+# -----------------------------------------------------------------------
+_vn_utils_path = Path(__file__).resolve().parent / "verbnet_utils.py"
+_vn_spec = importlib.util.spec_from_file_location("_verbnet_utils", _vn_utils_path)
+_vn_mod  = importlib.util.module_from_spec(_vn_spec)
+_vn_spec.loader.exec_module(_vn_mod)
+
+_WNL = _vn_mod._WNL
+_VN_CLASS_PREFERENCE = _vn_mod._VN_CLASS_PREFERENCE
+_STOP_ARTICLES_VN = _vn_mod._STOP_ARTICLES_VN
+_PREPOSITIONS_VN = _vn_mod._PREPOSITIONS_VN
+_KNOWN_VERB_MAP = _vn_mod._KNOWN_VERB_MAP
+_KNOWN_VERB_SORTED = _vn_mod._KNOWN_VERB_SORTED
+_resolve_vn_class = _vn_mod._resolve_vn_class
+_parse_subtask_verbnet = _vn_mod._parse_subtask_verbnet
+
+
+def _safe_perplexity(n: int) -> int:
+    if n <= 3:
+        return 2
+    return min(30, n - 1)
+
+
+def verbnet_hierarchical_cluster(
+    subtask_texts: list[str],
+    task_ids: list[int],
+    embeddings: np.ndarray,
+    dist_threshold: float,
+    output_dir: Path,
+    task_languages: list[str],
+):
+    """Two-level hierarchy using real NLTK VerbNet:
+
+    Level 1: VerbNet class (linguistic verb category from VerbNet corpus)
+    Level 2: concrete verb_phrase + head_noun combination
+    """
+    del dist_threshold
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    parses = [_parse_subtask_verbnet(t) for t in subtask_texts]
+
+    global_labels: list[str] = []
+    level1_groups: dict[str, list[int]] = {}
+    level2_groups: dict[str, list[int]] = {}
+    for i, p in enumerate(parses):
+        level1 = p["verbnet_class"]
+        level2 = p["level2_key"]
+        gl = f"{level1}.{level2}"
+        global_labels.append(gl)
+        level1_groups.setdefault(level1, []).append(i)
+        level2_groups.setdefault(gl, []).append(i)
+
+    cluster_labels_sorted = sorted(level2_groups.keys())
+    cluster_id_map = {k: i for i, k in enumerate(cluster_labels_sorted)}
+    int_labels = np.array([cluster_id_map[g] for g in global_labels], dtype=int)
+    n_clusters = len(cluster_labels_sorted)
+
+    center_texts: dict[int, str] = {}
+    center_indices: dict[int, int] = {}
+    for gl, cid in cluster_id_map.items():
+        idxs = level2_groups[gl]
+        rep_idx = idxs[0]
+        center_indices[cid] = rep_idx
+        center_texts[cid] = subtask_texts[rep_idx]
+
+    print(
+        f"\n[VerbNet] Hierarchy built (NLTK VerbNet): "
+        f"{len(level1_groups)} level-1 classes, {n_clusters} level-2 clusters"
+    )
+    for c in sorted(level1_groups.keys()):
+        uniq_l2 = len({global_labels[i] for i in level1_groups[c]})
+        print(f"  {c:30s} -> {len(level1_groups[c]):3d} subtasks, {uniq_l2:2d} l2")
+
+    # ---- t-SNE visualisation ----
+    norm_emb = normalize(embeddings)
+    perplexity = _safe_perplexity(len(subtask_texts))
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
+    xy = tsne.fit_transform(norm_emb)
+
+    classes = sorted(level1_groups.keys())
+    class_to_color = {c: i for i, c in enumerate(classes)}
+    cmap20 = plt.get_cmap("tab20")
+    colors = [cmap20((class_to_color[parses[i]["verbnet_class"]] % 20) / 20) for i in range(len(parses))]
+
+    fig, ax = plt.subplots(figsize=(16, 11))
+    ax.scatter(xy[:, 0], xy[:, 1], c=colors, s=16, alpha=0.62, linewidths=0, zorder=2)
+
+    for cid, idx in center_indices.items():
+        cx, cy = xy[idx]
+        p = parses[idx]
+        class_color = cmap20((class_to_color[p["verbnet_class"]] % 20) / 20)
+        ax.scatter(cx, cy, c=[class_color], s=240, marker="*", edgecolors="black", linewidths=0.6, zorder=5)
+        short = p["level2_key"]
+        if len(short) > 28:
+            short = short[:28] + "..."
+        ax.annotate(
+            f"{p['verbnet_class']}: {short}",
+            xy=(cx, cy), xytext=(6, 4), textcoords="offset points",
+            fontsize=11, color="black",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=class_color, alpha=0.85, linewidth=0.8),
+            zorder=6,
+        )
+
+    legend_handles = [
+        mpatches.Patch(
+            color=cmap20((class_to_color[c] % 20) / 20),
+            label=f"{c} ({len(level1_groups[c])})",
+        )
+        for c in classes
+    ]
+    ax.legend(
+        handles=legend_handles,
+        bbox_to_anchor=(1.01, 1),
+        loc="upper left",
+        fontsize=12,
+        title=f"VerbNet L1 classes ({len(classes)})",
+        title_fontsize=14,
+    )
+    ax.set_title(
+        "VerbNet Hierarchical Skill Library - LIBERO-90\n"
+        "Level-1: VerbNet class (NLTK)   Level-2: Verb + Noun",
+        fontsize=16,
+    )
+    ax.set_xlabel("t-SNE dim 1", fontsize=14)
+    ax.set_ylabel("t-SNE dim 2", fontsize=14)
+    ax.tick_params(labelsize=12)
+    plt.tight_layout()
+    scatter_path = output_dir / "skill_clusters_tsne.png"
+    fig.savefig(scatter_path, dpi=150)
+    plt.close(fig)
+    print(f"[VerbNet] Scatter plot saved -> {scatter_path}")
+
+    # ---- text summary ----
+    summary_lines = []
+    print(f"\n[VerbNet] {n_clusters} level-2 clusters:")
+    for level1 in classes:
+        summary_lines.append(f"\n{'#'*70}")
+        summary_lines.append(f"# VERBNET CLASS: {level1}")
+        summary_lines.append(f"{'#'*70}")
+
+        class_level2 = sorted([
+            gl for gl in cluster_labels_sorted if gl.startswith(level1 + ".")
+        ])
+        for gl in class_level2:
+            cid = cluster_id_map[gl]
+            members = level2_groups[gl]
+            rep = center_texts[cid]
+            p = parses[members[0]]
+
+            summary_lines.append(f"\n{'='*60}")
+            summary_lines.append(f"Cluster {gl} ({len(members)} subtasks)")
+            summary_lines.append(
+                f"  Representative: {rep} | lemma={p['verb_lemma']} | noun={p['head_noun']}"
+            )
+            summary_lines.append(f"{'='*60}")
+            print(f"  {gl:50s} * {rep}")
+
+            seen = set()
+            for idx in members:
+                text = subtask_texts[idx]
+                key = text.lower().strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                prefix = "  *" if text == rep else "  -"
+                summary_lines.append(f"{prefix} {text}")
+
+    summary_path = output_dir / "skill_clusters_summary.txt"
+    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+    print(f"[VerbNet] Text summary saved -> {summary_path}")
+
+    # ---- detailed records ----
+    records = []
+    for i, (text, tid, gl) in enumerate(zip(subtask_texts, task_ids, global_labels)):
+        cid = cluster_id_map[gl]
+        p = parses[i]
+        records.append({
+            "subtask": text,
+            "task_id": tid,
+            "task_language": task_languages[tid],
+            "verbnet_class": p["verbnet_class"],
+            "verb_phrase": p["verb_phrase"],
+            "verb_lemma": p["verb_lemma"],
+            "object_phrase": p["object_phrase"],
+            "head_noun": p["head_noun"],
+            "level2_key": p["level2_key"],
+            "cluster": gl,
+            "cluster_int": cid,
+            "cluster_representative": center_texts[cid],
+            "is_representative": (text == center_texts[cid]),
+        })
+
+    json_path = output_dir / "skill_lib_records.json"
+    json_path.write_text(
+        json.dumps(records, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"[VerbNet] Detailed records saved -> {json_path}")
+
+    # ---- per-task assignment ----
+    task_cluster_map: dict[int, dict] = {}
+    for i, (text, tid, gl) in enumerate(zip(subtask_texts, task_ids, global_labels)):
+        cid = cluster_id_map[gl]
+        p = parses[i]
+        if tid not in task_cluster_map:
+            task_cluster_map[tid] = {
+                "task_id": tid,
+                "task_language": task_languages[tid],
+                "subtasks": [],
+            }
+        task_cluster_map[tid]["subtasks"].append({
+            "text": text,
+            "cluster": gl,
+            "cluster_int": cid,
+            "verbnet_class": p["verbnet_class"],
+            "level2_key": p["level2_key"],
+            "cluster_representative": center_texts[cid],
+            "is_representative": (text == center_texts[cid]),
+        })
+
+    task_json_path = output_dir / "task_cluster_assignments.json"
+    task_json_path.write_text(
+        json.dumps([task_cluster_map[tid] for tid in sorted(task_cluster_map)], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"[VerbNet] Per-task assignments saved -> {task_json_path}")
+
+    # ---- cluster representatives ----
+    rep_map = {}
+    for gl, cid in sorted(cluster_id_map.items(), key=lambda x: x[1]):
+        p = parses[center_indices[cid]]
+        rep_map[gl] = {
+            "representative": center_texts[cid],
+            "cluster_int": cid,
+            "verbnet_class": p["verbnet_class"],
+            "level2_key": p["level2_key"],
+        }
+
+    rep_path = output_dir / "cluster_representatives.json"
+    rep_path.write_text(
+        json.dumps(rep_map, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"[VerbNet] Representatives saved -> {rep_path}")
+
+    return int_labels, level2_groups
+
+
+
+def parse_obs_structure(obs: dict[str, Any]) -> dict[str, Any]:
+    """Return a JSON-serialisable summary of LIBERO observation dict."""
+    summary: dict[str, Any] = {
+        "keys": sorted(list(obs.keys())),
+        "fields": {},
+    }
+    for k, v in obs.items():
+        item: dict[str, Any] = {"python_type": type(v).__name__}
+        if isinstance(v, np.ndarray):
+            item.update(
+                {
+                    "shape": list(v.shape),
+                    "dtype": str(v.dtype),
+                    "min": float(np.min(v)) if v.size > 0 else None,
+                    "max": float(np.max(v)) if v.size > 0 else None,
+                }
+            )
+        elif isinstance(v, (float, int, bool, str)):
+            item["value"] = v
+        elif isinstance(v, (list, tuple)):
+            item["length"] = len(v)
+            if len(v) > 0 and isinstance(v[0], np.ndarray):
+                item["first_elem_shape"] = list(v[0].shape)
+                item["first_elem_dtype"] = str(v[0].dtype)
+        elif isinstance(v, dict):
+            item["nested_keys"] = sorted(list(v.keys()))
+        summary["fields"][k] = item
+    return summary
+
+
+def build_skill_index_embeddings(
+    s_goal: np.ndarray,
+    s_env: np.ndarray,
+    task_ids: list[int],
+    mode: str,
+    goal_weight: float,
+    env_weight: float,
+) -> np.ndarray:
+    """
+    Build per-subtask index vectors from goal/env embeddings.
+
+    mode:
+      - goal:      index = s_goal
+      - env:       index = s_env(task)
+      - goal_env:  index = concat(goal_weight * norm(s_goal), env_weight * norm(s_env(task)))
+    """
+    s_goal = np.asarray(s_goal, dtype=np.float32)
+    s_env = np.asarray(s_env, dtype=np.float32)
+
+    if mode == "goal":
+        return s_goal
+
+    per_subtask_env = s_env[np.asarray(task_ids, dtype=np.int64)]
+    if mode == "env":
+        return per_subtask_env
+
+    # goal_env
+    goal_norm = normalize(s_goal)
+    env_norm = normalize(per_subtask_env)
+    return np.concatenate([goal_weight * goal_norm, env_weight * env_norm], axis=1)
+
+
+
+def _random_projection_matrix(d_in: int, d_out: int, seed: int = 42) -> np.ndarray:
+    """Generate a fixed random Gaussian projection matrix.
+
+    Uses orthogonal rows when d_out <= d_in for better distance preservation
+    (Johnson-Lindenstrauss style).  The seed is fixed so that the same
+    projection is reproducible across runs.
+    """
+    rng = np.random.RandomState(seed)
+    if d_out <= d_in:
+        # QR on a random matrix → orthonormal rows
+        M = rng.randn(d_out, d_in).astype(np.float32)
+        Q, _ = np.linalg.qr(M.T)          # Q: (d_in, d_out)
+        return Q.T                          # (d_out, d_in)
+    else:
+        # Over-projection (unusual) – just normalise rows
+        M = rng.randn(d_out, d_in).astype(np.float32)
+        norms = np.linalg.norm(M, axis=1, keepdims=True).clip(1e-8)
+        return M / norms
+
+
+def build_segmented_skill_embeddings(
+    subtask_texts: list[str],
+    task_ids: list[int],
+    s_env: np.ndarray,
+    sbert_model: str = "all-MiniLM-L6-v2",
+    d_action: int = 16,
+    d_object: int = 40,
+    d_context: int = 32,
+    seed: int = 42,
+) -> dict:
+    """Build three-segment compressed skill embeddings.
+
+    Segments
+    --------
+    s_action  : verb phrase  → SBERT → random projection → [d_action]
+    s_object  : object noun phrase → SBERT → random projection → [d_object]
+    s_context : s_env (per-task visual) → random projection → [d_context]
+
+    Total dim = d_action + d_object + d_context  (default 88 < 100).
+
+    Returns
+    -------
+    dict with keys:
+        "s_action"       – (N, d_action)
+        "s_object"       – (N, d_object)
+        "s_context"      – (N, d_context)
+        "embeddings"     – (N, d_action+d_object+d_context) concatenated
+        "action_texts"   – list[str]  verb phrases
+        "object_texts"   – list[str]  object noun phrases
+        "proj_action"    – (d_action, D_sbert) projection matrix
+        "proj_object"    – (d_object, D_sbert) projection matrix
+        "proj_context"   – (d_context, D_env)  projection matrix
+        "segment_dims"   – dict {name: dim}
+    """
+    from sentence_transformers import SentenceTransformer
+
+    N = len(subtask_texts)
+    s_env = np.asarray(s_env, dtype=np.float32)
+    D_env = s_env.shape[1]
+
+    # ---- 1. Parse subtasks into action / object texts ----
+    action_texts: list[str] = []
+    object_texts: list[str] = []
+    verbnet_classes: list[str] = []
+    for text in subtask_texts:
+        parsed = _parse_subtask_verbnet(text)
+        action_texts.append(parsed["verb_phrase"])
+        object_texts.append(parsed["object_phrase"] or "object")
+        verbnet_classes.append(parsed["verbnet_class"])
+
+    # ---- 2. Encode with SBERT ----
+    print(f"[Segmented] Loading SBERT model: {sbert_model}")
+    sbert = SentenceTransformer(sbert_model, device="cpu")
+    D_sbert = sbert.get_sentence_embedding_dimension()
+
+    print(f"[Segmented] Encoding {N} action phrases …")
+    action_raw = sbert.encode(
+        action_texts, batch_size=128, show_progress_bar=False,
+        convert_to_numpy=True, normalize_embeddings=False,
+    ).astype(np.float32)  # (N, D_sbert)
+
+    print(f"[Segmented] Encoding {N} object phrases …")
+    object_raw = sbert.encode(
+        object_texts, batch_size=128, show_progress_bar=False,
+        convert_to_numpy=True, normalize_embeddings=False,
+    ).astype(np.float32)  # (N, D_sbert)
+
+    # ---- 3. Per-subtask s_env lookup ----
+    per_subtask_env = s_env[np.asarray(task_ids, dtype=np.int64)]  # (N, D_env)
+
+    # ---- 4. Random projection ----
+    print(f"[Segmented] Random projection: "
+          f"action {D_sbert}→{d_action}, "
+          f"object {D_sbert}→{d_object}, "
+          f"context {D_env}→{d_context}")
+    proj_A = _random_projection_matrix(D_sbert, d_action,  seed=seed)
+    proj_O = _random_projection_matrix(D_sbert, d_object,  seed=seed + 1)
+    proj_C = _random_projection_matrix(D_env,   d_context, seed=seed + 2)
+
+    s_action  = (normalize(action_raw)  @ proj_A.T)   # (N, d_action)
+    s_object  = (normalize(object_raw)  @ proj_O.T)   # (N, d_object)
+    s_context = (normalize(per_subtask_env) @ proj_C.T)  # (N, d_context)
+
+    embeddings = np.concatenate([s_action, s_object, s_context], axis=1)
+    total_dim = d_action + d_object + d_context
+
+    print(f"[Segmented] Final embedding: ({N}, {total_dim})  "
+          f"[action={d_action} | object={d_object} | context={d_context}]")
+
+    return {
+        "s_action": s_action,
+        "s_object": s_object,
+        "s_context": s_context,
+        "embeddings": embeddings,
+        "action_texts": action_texts,
+        "object_texts": object_texts,
+        "verbnet_classes": verbnet_classes,
+        "proj_action": proj_A,
+        "proj_object": proj_O,
+        "proj_context": proj_C,
+        "segment_dims": {
+            "action": d_action,
+            "object": d_object,
+            "context": d_context,
+            "total": total_dim,
+        },
+    }
+
+
+# -----------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------
+
+def build_env(task_bddl_file: Path, seed: int) -> OffScreenRenderEnv:
+    env = OffScreenRenderEnv(
+        bddl_file_name=task_bddl_file,
+        camera_heights=256,
+        camera_widths=256,
+    )
+    env.seed(seed)
+    return env
+
+
+def get_initial_obs(env: OffScreenRenderEnv, init_state) -> dict:
+    env.reset()
+    return env.set_init_state(init_state)
+
+
+def obs_to_images(obs: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Return (agentview, wrist) images both rotated 180° (eval convention)."""
+    main_img  = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+    return main_img, wrist_img
+
+
+def save_task_artifacts(
+    output_dir: Path,
+    task_id: int,
+    task_language: str,
+    main_img: np.ndarray,
+    wrist_img: np.ndarray,
+    subtasks: list[str],
+):
+    """Save per-task images and subtask text for later reuse."""
+    task_dir = output_dir / "task_artifacts" / f"task_{task_id:03d}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    Image.fromarray(main_img.astype(np.uint8)).save(task_dir / "agentview.png")
+    Image.fromarray(wrist_img.astype(np.uint8)).save(task_dir / "wrist.png")
+
+    (task_dir / "subtasks.json").write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "task_language": task_language,
+                "subtasks": subtasks,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def load_task_artifacts(
+    task_artifacts_dir: Path,
+    task_id: int,
+) -> tuple[np.ndarray, np.ndarray, list[str], str]:
+    """Load per-task images and subtasks previously saved by save_task_artifacts."""
+    task_dir = task_artifacts_dir / f"task_{task_id:03d}"
+    agent_path = task_dir / "agentview.png"
+    wrist_path = task_dir / "wrist.png"
+    subtasks_path = task_dir / "subtasks.json"
+
+    if not agent_path.exists() or not wrist_path.exists() or not subtasks_path.exists():
+        raise FileNotFoundError(f"Missing artifacts under {task_dir}")
+
+    main_img = np.array(Image.open(agent_path).convert("RGB"), dtype=np.uint8)
+    wrist_img = np.array(Image.open(wrist_path).convert("RGB"), dtype=np.uint8)
+
+    meta = json.loads(subtasks_path.read_text(encoding="utf-8"))
+    subtasks = meta.get("subtasks", [])
+    task_language = meta.get("task_language", "")
+    if not isinstance(subtasks, list):
+        raise ValueError(f"Invalid subtasks format in {subtasks_path}")
+    return main_img, wrist_img, subtasks, task_language
+
+
+# -----------------------------------------------------------------------
+# clustering & visualisation
+# -----------------------------------------------------------------------
+
+def segmented_hierarchical_cluster(
+    subtask_texts: list[str],
+    task_ids: list[int],
+    seg_result: dict,
+    dist_threshold: float,
+    output_dir,
+    task_languages: list[str],
+):
+    import numpy as np
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.manifold import TSNE
+    import matplotlib.pyplot as plt
+    import json
+    
+    s_action = seg_result["s_action"]
+    s_object = seg_result["s_object"]
+    s_context = seg_result["s_context"]
+    embeddings = seg_result["embeddings"]
+    verbnet_classes = np.array(seg_result["verbnet_classes"])
+    
+    N = len(subtask_texts)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def cluster_subset(emb_subset, threshold):
+        if len(emb_subset) <= 1:
+            return np.zeros(len(emb_subset), dtype=int)
+        agg = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=threshold,
+            linkage="average",
+            metric="euclidean",
+        )
+        return agg.fit_predict(emb_subset)
+    
+    from sklearn.preprocessing import normalize
+    
+    # 1. Level 1: Action (Big action mode)
+    # We use VerbNet classes directly to group verbs properly into robust modes
+    unique_vn_classes = np.unique(verbnet_classes)
+    print(f"\n[Segmented-Hier] Level 1: Action grouping based on {len(unique_vn_classes)} VerbNet classes")
+    
+    l1_labels_str = verbnet_classes
+    
+    # 2. Level 2: Combined (Action + Object + Context)
+    # We cluster the full structured embedding within each VerbNet action mode
+    # dist_threshold is passed from the command line (default ~0.6)
+    l2_labels = np.zeros(N, dtype=int)
+    max_l2 = 0
+    
+    # normalize full embeddings first
+    norm_embeddings = normalize(embeddings)
+    
+    for c1_str in unique_vn_classes:
+        mask1 = (l1_labels_str == c1_str)
+        sub_l2 = cluster_subset(norm_embeddings[mask1], threshold=dist_threshold)
+        l2_labels[mask1] = sub_l2 + max_l2
+        max_l2 += (sub_l2.max() + 1)
+        
+    labels = l2_labels
+    n_clusters = max_l2
+    print(f"[Segmented-Hier] Found {n_clusters} clusters at leaf level (VerbNet Class -> Composite Embedding).")
+    
+    center_indices: dict[int, int] = {}
+    center_texts:   dict[int, str] = {}
+    for cid in range(n_clusters):
+        mask = np.where(labels == cid)[0]
+        centroid = norm_embeddings[mask].mean(axis=0)
+        dists = np.linalg.norm(norm_embeddings[mask] - centroid, axis=1)
+        closest_global = int(mask[int(np.argmin(dists))])
+        center_indices[cid] = closest_global
+        center_texts[cid] = f"{l1_labels_str[closest_global]}.C{cid} | " + subtask_texts[closest_global]
+        
+    # t-SNE
+    print("[Cluster] Running t-SNE for 2-D projection …")
+    perplexity = min(30, max(1, len(subtask_texts) - 1))
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
+    xy = tsne.fit_transform(embeddings)
+    
+    cmap20 = plt.get_cmap("tab20")
+    def _color(cid):
+        return cmap20((cid % 20) / 20)
+        
+    colors = [_color(l) for l in labels]
+    fig, ax = plt.subplots(figsize=(16, 11))
+    ax.scatter(xy[:, 0], xy[:, 1], c=colors, s=18, alpha=0.60, linewidths=0, zorder=2)
+    
+    for cid, idx in center_indices.items():
+        cx, cy = xy[idx]
+        color = _color(cid)
+        ax.scatter([cx], [cy], c=[color], marker="*", s=400, edgecolors="white", linewidths=1.0, zorder=4)
+        ax.annotate(
+            center_texts[cid],
+            (cx, cy),
+            xytext=(6, 6),
+            textcoords="offset points",
+            fontsize=8,
+            fontweight="bold",
+            color="black",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.9, ec="none"),
+            zorder=5,
+        )
+        
+    plt.title(f"Segmented Hierarchical Skills (2-Level)\n{n_clusters} clusters (thr=A:0.3/C:{dist_threshold})")
+    plt.axis("off")
+    plt.tight_layout()
+    plot_path = output_dir / "segmented_hier_clusters_tsne.pdf"
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[Cluster] Plot saved -> {plot_path}")
+    
+    clusters_info = {}
+    for cid in range(n_clusters):
+        mask = np.where(labels == cid)[0].tolist()
+        clusters_info[f"Cluster_{cid}"] = {
+            "representative": center_texts[cid],
+            "size": len(mask),
+            "members": [subtask_texts[i] for i in mask]
+        }
+        
+    summary_path = output_dir / "segmented_hier_clusters_summary.txt"
+    with summary_path.open("w", encoding="utf-8") as f:
+        f.write(f"=== Segmented Hierarchical Clustering ===\n")
+        f.write(f"Total Subtasks: {len(subtask_texts)}\n")
+        f.write(f"Total Clusters: {n_clusters}\n\n")
+        for cid in range(n_clusters):
+            f.write(f"Cluster {cid:03d} (size {clusters_info[f'Cluster_{cid}']['size']:3d}) : {center_texts[cid]}\n")
+            
+    print(f"[Cluster] Summary -> {summary_path}")
+
+
+# -----------------------------------------------------------------------
+# Three-layer multimodal hierarchical skill library (V4)
+# -----------------------------------------------------------------------
+
+def build_3layer_hierarchical_library(
+    subtask_texts: list[str],
+    task_ids: list[int],
+    s_action: np.ndarray,
+    s_object: np.ndarray,
+    s_context: np.ndarray,
+    dist_threshold_object: float,
+    dist_threshold_context: float,
+    output_dir: Path,
+    task_languages: list[str],
+    vl_descriptions: list[str] | None = None,
+):
+    """Build a 3-level hierarchical skill library and visualise.
+
+    Hierarchy
+    ---------
+      L1 (deterministic): VerbNet action class from verb phrase parsing.
+      L2 (learned):       Agglomerative clustering on s_object within each L1 bucket.
+      L3 (learned):       Agglomerative clustering on s_context within each L2 cluster.
+
+    Saves
+    -----
+      hierarchical_3layer_library.json   – full tree with centroids and members
+      hier3_clusters_tsne.png            – t-SNE visualisation
+      hier3_summary.txt                  – textual summary
+      hier3_assignments.json             – per-subtask path assignments
+    """
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.manifold import TSNE
+    from sklearn.preprocessing import normalize as sk_normalize
+    import matplotlib.pyplot as plt
+
+    N = len(subtask_texts)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Parse VerbNet classes for L1 ----
+    verbnet_classes: list[str] = []
+    verb_phrases: list[str] = []
+    head_nouns: list[str] = []
+    for text in subtask_texts:
+        parsed = _parse_subtask_verbnet(text)
+        verbnet_classes.append(parsed["verbnet_class"])
+        verb_phrases.append(parsed["verb_phrase"])
+        head_nouns.append(parsed["head_noun"])
+
+    vn_arr = np.array(verbnet_classes)
+    unique_l1 = sorted(set(verbnet_classes))
+
+    # ---- helper: agglomerative cluster on a subset ----
+    def _cluster_subset(emb: np.ndarray, threshold: float) -> np.ndarray:
+        if len(emb) <= 1:
+            return np.zeros(len(emb), dtype=int)
+        normed = sk_normalize(emb)
+        agg = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=threshold,
+            linkage="average",
+            metric="euclidean",
+        )
+        return agg.fit_predict(normed)
+
+    # ---- Build hierarchy ----
+    # Each subtask gets a 3-level path: "vn_class / L2_id / L3_id"
+    paths: list[str] = [""] * N               # per-subtask full path
+    l2_labels = np.full(N, -1, dtype=int)
+    l3_labels = np.full(N, -1, dtype=int)
+
+    library: dict = {}   # nested dict for JSON output
+    global_l2_counter = 0
+    global_l3_counter = 0
+
+    print(f"\n[Hier3] Building 3-layer hierarchy over {N} subtasks …")
+    print(f"[Hier3] L1: {len(unique_l1)} VerbNet classes,  "
+          f"L2 thr(object)={dist_threshold_object},  L3 thr(context)={dist_threshold_context}")
+
+    for l1_class in unique_l1:
+        l1_mask = np.where(vn_arr == l1_class)[0]
+        library[l1_class] = {"members_count": len(l1_mask), "l2_clusters": {}}
+
+        # L2: cluster s_object within this L1
+        sub_obj = s_object[l1_mask]
+        l2_sub = _cluster_subset(sub_obj, dist_threshold_object)
+        n_l2 = l2_sub.max() + 1 if len(l2_sub) > 0 else 0
+
+        for l2_local in range(n_l2):
+            l2_id = f"{l1_class}.{l2_local}"
+            l2_in_l1 = np.where(l2_sub == l2_local)[0]
+            l2_global = l1_mask[l2_in_l1]
+
+            # Centroid for L2 (in s_object space)
+            l2_centroid = s_object[l2_global].mean(axis=0)
+
+            library[l1_class]["l2_clusters"][l2_id] = {
+                "centroid_s_o": l2_centroid.tolist(),
+                "members_count": len(l2_global),
+                "l3_clusters": {},
+            }
+
+            for idx in l2_global:
+                l2_labels[idx] = global_l2_counter
+
+            # L3: cluster s_context within this L2
+            sub_ctx = s_context[l2_global]
+            l3_sub = _cluster_subset(sub_ctx, dist_threshold_context)
+            n_l3 = l3_sub.max() + 1 if len(l3_sub) > 0 else 0
+
+            for l3_local in range(n_l3):
+                l3_id = f"{l2_id}.{l3_local}"
+                l3_in_l2 = np.where(l3_sub == l3_local)[0]
+                l3_global = l2_global[l3_in_l2]
+
+                # Centroid for L3 (in s_context space)
+                l3_centroid = s_context[l3_global].mean(axis=0)
+
+                # Representative: closest to centroid
+                dists = np.linalg.norm(s_context[l3_global] - l3_centroid, axis=1)
+                rep_local = int(np.argmin(dists))
+                rep_global = int(l3_global[rep_local])
+
+                member_details = []
+                for gi in l3_global:
+                    gi = int(gi)
+                    detail = {
+                        "subtask": subtask_texts[gi],
+                        "task_id": int(task_ids[gi]),
+                        "head_noun": head_nouns[gi],
+                    }
+                    if vl_descriptions is not None:
+                        detail["vl_description"] = vl_descriptions[gi]
+                    member_details.append(detail)
+
+                library[l1_class]["l2_clusters"][l2_id]["l3_clusters"][l3_id] = {
+                    "centroid_s_c": l3_centroid.tolist(),
+                    "representative": subtask_texts[rep_global],
+                    "representative_idx": rep_global,
+                    "members": member_details,
+                }
+
+                for gi in l3_global:
+                    l3_labels[gi] = global_l3_counter
+                    paths[gi] = l3_id
+
+                global_l3_counter += 1
+
+            global_l2_counter += 1
+
+    print(f"[Hier3] Result: L1={len(unique_l1)} classes, "
+          f"L2={global_l2_counter} clusters, L3={global_l3_counter} leaf clusters")
+
+    # ---- Save library JSON ----
+    (output_dir / "hierarchical_3layer_library.json").write_text(
+        json.dumps(library, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # ---- Per-subtask assignments ----
+    assignments = []
+    for i in range(N):
+        assignments.append({
+            "subtask": subtask_texts[i],
+            "task_id": int(task_ids[i]),
+            "path": paths[i],
+            "l1_class": verbnet_classes[i],
+            "l2_label": int(l2_labels[i]),
+            "l3_label": int(l3_labels[i]),
+            "verb_phrase": verb_phrases[i],
+            "head_noun": head_nouns[i],
+        })
+    (output_dir / "hier3_assignments.json").write_text(
+        json.dumps(assignments, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # ---- Summary ----
+    summary_path = output_dir / "hier3_summary.txt"
+    with summary_path.open("w", encoding="utf-8") as f:
+        f.write(f"=== 3-Layer Hierarchical Skill Library ===\n")
+        f.write(f"Total subtasks: {N}\n")
+        f.write(f"L1 (VerbNet classes): {len(unique_l1)}\n")
+        f.write(f"L2 (object clusters): {global_l2_counter}\n")
+        f.write(f"L3 (context clusters): {global_l3_counter}\n")
+        f.write(f"Object threshold: {dist_threshold_object}\n")
+        f.write(f"Context threshold: {dist_threshold_context}\n\n")
+        for l1_class in unique_l1:
+            l1_info = library[l1_class]
+            f.write(f"L1: {l1_class} ({l1_info['members_count']} subtasks)\n")
+            for l2_id, l2_info in l1_info["l2_clusters"].items():
+                f.write(f"  L2: {l2_id} ({l2_info['members_count']} subtasks)\n")
+                for l3_id, l3_info in l2_info["l3_clusters"].items():
+                    rep = l3_info["representative"]
+                    f.write(f"    L3: {l3_id} ({len(l3_info['members'])} subtasks) ★ {rep}\n")
+
+    print(f"[Hier3] Summary → {summary_path}")
+
+    # ---- t-SNE visualisation ----
+    embeddings_concat = np.concatenate([s_action, s_object, s_context], axis=1)
+    perplexity = min(30, max(2, N - 1))
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
+    xy = tsne.fit_transform(embeddings_concat)
+
+    # Colour by L1 (hue), marker size by L2
+    cmap = plt.get_cmap("tab10")
+    l1_to_idx = {c: i for i, c in enumerate(unique_l1)}
+
+    fig, ax = plt.subplots(figsize=(16, 11))
+    for i in range(N):
+        c = cmap(l1_to_idx[verbnet_classes[i]] % 10)
+        ax.scatter(xy[i, 0], xy[i, 1], c=[c], s=20, alpha=0.6, linewidths=0)
+
+    # Mark L3 representatives with ★ and representative subtask text
+    for l1_class in unique_l1:
+        for l2_id, l2_info in library[l1_class]["l2_clusters"].items():
+            for l3_id, l3_info in l2_info["l3_clusters"].items():
+                ri = l3_info["representative_idx"]
+                rep_text = l3_info["representative"]
+                # Truncate long text for readability
+                _label_text = rep_text if len(rep_text) <= 40 else rep_text[:37] + "…"
+                _label = f"{l3_id}\n{_label_text}"
+                c = cmap(l1_to_idx[l1_class] % 10)
+                ax.scatter(xy[ri, 0], xy[ri, 1], c=[c], marker="*", s=300,
+                           edgecolors="white", linewidths=0.8, zorder=4)
+                ax.annotate(
+                    _label,
+                    (xy[ri, 0], xy[ri, 1]),
+                    xytext=(5, 5), textcoords="offset points",
+                    fontsize=5, color="black",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.85, ec="none"),
+                    zorder=5,
+                )
+
+    # Legend for L1
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="w",
+               markerfacecolor=cmap(l1_to_idx[c] % 10), markersize=8, label=c)
+        for c in unique_l1
+    ]
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=7, ncol=2)
+    ax.set_title(f"3-Layer Hierarchical Skills\n"
+                 f"L1={len(unique_l1)} | L2={global_l2_counter} | L3={global_l3_counter}")
+    ax.axis("off")
+    plt.tight_layout()
+
+    plot_path = output_dir / "hier3_clusters_tsne.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[Hier3] Plot → {plot_path}")
+
+    return library
+
+
+# -----------------------------------------------------------------------
+
+def cluster_and_visualise(
+    subtask_texts: list[str],
+    task_ids: list[int],        # which libero task each subtask belongs to
+    embeddings: np.ndarray,
+    dist_threshold: float,      # Euclidean distance threshold in L2-norm space
+    output_dir: Path,
+    task_languages: list[str],  # high-level language per task_id index
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Agglomerative clustering with distance threshold (no fixed k) ----
+    # Embeddings are L2-normalised so Euclidean distance ∈ [0, 2].
+    # A new cluster is created whenever a merge would exceed dist_threshold.
+    norm_emb = normalize(embeddings)
+    print(f"\n[Cluster] Agglomerative clustering (threshold={dist_threshold}) "
+          f"on {len(subtask_texts)} subtasks …")
+    agg = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=dist_threshold,
+        linkage="average",
+        metric="euclidean",
+    )
+    labels = agg.fit_predict(norm_emb)
+    n_clusters = int(labels.max()) + 1
+    print(f"[Cluster] Found {n_clusters} clusters automatically.")
+
+    # ---- compute centroids manually & find closest sample ----
+    center_indices: dict[int, int] = {}   # cluster_id -> sample index
+    center_texts:   dict[int, str] = {}   # cluster_id -> representative text
+    for cid in range(n_clusters):
+        mask = np.where(labels == cid)[0]
+        centroid = norm_emb[mask].mean(axis=0)
+        dists = np.linalg.norm(norm_emb[mask] - centroid, axis=1)
+        closest_global = int(mask[int(np.argmin(dists))])
+        center_indices[cid] = closest_global
+        center_texts[cid] = subtask_texts[closest_global]
+
+    # ---- t-SNE ----
+    print("[Cluster] Running t-SNE for 2-D projection …")
+    perplexity = min(30, len(subtask_texts) - 1)
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
+    xy = tsne.fit_transform(embeddings)
+
+    # ---- scatter plot ----
+    # tab20 has 20 colours; cycle if more clusters
+    cmap20 = plt.get_cmap("tab20")
+    def _color(cid):
+        return cmap20((cid % 20) / 20)
+
+    colors = [_color(l) for l in labels]
+    fig, ax = plt.subplots(figsize=(16, 11))
+    ax.scatter(xy[:, 0], xy[:, 1], c=colors, s=18, alpha=0.60, linewidths=0, zorder=2)
+
+    # highlight centroid representatives: star marker + annotation
+    for cid, idx in center_indices.items():
+        cx, cy = xy[idx]
+        color = _color(cid)
+        ax.scatter(cx, cy, c=[color], s=280, marker="*",
+                   edgecolors="black", linewidths=0.6, zorder=5)
+        label_text = center_texts[cid]
+        if len(label_text) > 28:
+            label_text = label_text[:26] + "…"
+        ax.annotate(
+            f"C{cid}: {label_text}",
+            xy=(cx, cy), xytext=(6, 4), textcoords="offset points",
+            fontsize=5.5, color="black",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color,
+                      alpha=0.85, linewidth=0.8),
+            zorder=6,
+        )
+
+    patches = [
+        mpatches.Patch(
+            color=_color(i),
+            label=f"C{i}: {center_texts[i][:35]}{'…' if len(center_texts[i]) > 35 else ''}"
+        )
+        for i in range(n_clusters)
+    ]
+    ax.legend(handles=patches, bbox_to_anchor=(1.01, 1), loc="upper left",
+              fontsize=6.0, title=f"Cluster (★ rep) – k={n_clusters} auto",
+              title_fontsize=7)
+    ax.set_title(
+        f"Skill library – LIBERO-90 subtask clusters\n"
+        f"threshold={dist_threshold}  →  k={n_clusters} clusters   "
+        f"★ = sample closest to centroid"
+    )
+    ax.set_xlabel("t-SNE dim 1")
+    ax.set_ylabel("t-SNE dim 2")
+    plt.tight_layout()
+    scatter_path = output_dir / "skill_clusters_tsne.png"
+    fig.savefig(scatter_path, dpi=150)
+    plt.close(fig)
+    print(f"[Cluster] Scatter plot saved → {scatter_path}")
+
+    # ---- per-cluster text summary ----
+    cluster_info: dict[int, list[str]] = {i: [] for i in range(n_clusters)}
+    for text, lbl in zip(subtask_texts, labels):
+        cluster_info[lbl].append(text)
+
+    summary_lines = []
+    print("\n[Cluster] Representative (★ = closest to centroid) per cluster:")
+    for cid in range(n_clusters):
+        members = cluster_info[cid]
+        rep = center_texts[cid]
+        summary_lines.append(f"\n{'='*60}")
+        summary_lines.append(f"Cluster {cid}  ({len(members)} subtasks)")
+        summary_lines.append(f"  ★ Representative: {rep}")
+        summary_lines.append(f"{'='*60}")
+        print(f"  C{cid:2d} ★ {rep}")
+        seen = set()
+        deduped = []
+        for m in members:
+            key = m.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(m)
+        for m in deduped[:30]:
+            prefix = "  ★" if m == rep else "  •"
+            summary_lines.append(f"{prefix} {m}")
+        if len(deduped) > 30:
+            summary_lines.append(f"  … ({len(deduped) - 30} more unique entries)")
+
+    summary_text = "\n".join(summary_lines)
+    summary_path = output_dir / "skill_clusters_summary.txt"
+    summary_path.write_text(summary_text, encoding="utf-8")
+    print(f"\n[Cluster] Text summary saved → {summary_path}")
+
+    # ---- flat records JSON (one entry per subtask) ----
+    lbl_list = labels.tolist()
+    records = []
+    for text, tid, lbl in zip(subtask_texts, task_ids, lbl_list):
+        records.append({
+            "subtask": text,
+            "task_id": tid,
+            "task_language": task_languages[tid],
+            "cluster": lbl,
+            "cluster_representative": center_texts[lbl],
+            "is_representative": (text == center_texts[lbl]),
+        })
+    json_path = output_dir / "skill_lib_records.json"
+    json_path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[Cluster] Flat records saved → {json_path}")
+
+    # ---- per-task cluster assignment JSON ----
+    # Build a dict keyed by task_id listing each subtask + its cluster.
+    task_cluster_map: dict[int, dict] = {}
+    for text, tid, lbl in zip(subtask_texts, task_ids, lbl_list):
+        if tid not in task_cluster_map:
+            task_cluster_map[tid] = {
+                "task_id": tid,
+                "task_language": task_languages[tid],
+                "subtasks": [],
+            }
+        task_cluster_map[tid]["subtasks"].append({
+            "text": text,
+            "cluster": lbl,
+            "cluster_representative": center_texts[lbl],
+            "is_representative": (text == center_texts[lbl]),
+        })
+    # sort by task_id and serialise
+    task_list = [task_cluster_map[tid] for tid in sorted(task_cluster_map)]
+    task_json_path = output_dir / "task_cluster_assignments.json"
+    task_json_path.write_text(
+        json.dumps(task_list, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"[Cluster] Per-task assignments saved → {task_json_path}")
+
+    # ---- cluster representatives mapping ----
+    rep_map = {str(cid): center_texts[cid] for cid in range(n_clusters)}
+    rep_path = output_dir / "cluster_representatives.json"
+    rep_path.write_text(json.dumps(rep_map, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[Cluster] Representatives saved → {rep_path}")
+
+    return labels, cluster_info
+
+
+# -----------------------------------------------------------------------
+# main
+# -----------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task_suite_name", type=str, default="libero_90")
+    parser.add_argument("--max_tasks", type=int, default=None,
+                        help="Cap number of tasks (default: all 90)")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--model_path", type=str,
+                        default="/export/ra/liyuxuan/VLA/starVLA/playground/Pretrained_models/Qwen3-VL-4B-Instruct")
+    parser.add_argument("--dist_threshold", type=float, default=0.6,
+                        help="Euclidean distance threshold in L2-normalised Qwen embedding space. "
+                             "Smaller value → more clusters. Range ~0–2 (default: 0.6).")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output_dir", type=str, default="skill_lib_results")
+    parser.add_argument("--no_render", action="store_true",
+                        help="Skip environment rendering; use blank 256x256 images")
+    parser.add_argument("--cluster_index", type=str, default="goal_env",
+                        choices=["goal", "env", "goal_env"],
+                        help="Embedding used for clustering index: goal/env/goal_env")
+    parser.add_argument("--goal_weight", type=float, default=1.0,
+                        help="Weight for s_goal when cluster_index=goal_env")
+    parser.add_argument("--env_weight", type=float, default=1.0,
+                        help="Weight for s_env when cluster_index=goal_env")
+    parser.add_argument("--encoder_mode", type=str, default="sbert",
+                        choices=["naive", "verb_aware", "sentence", "sbert", "oat", "verbnet", "segmented_hier", "hier3", "clip_film"],
+                        help="s_goal encoder: "
+                             "naive = simple mean-pool of input embeddings (V1 baseline); "
+                             "verb_aware = verb one-hot + arg-only hidden-state pooling (V1 advanced); "
+                             "sentence = adaptive hidden-state pooling, no hard-coded verbs (V2); "
+                             "sbert = sentence-transformer model (V2); "
+                             "oat = Object-Action-Target hierarchical clustering with human priors (V3); "
+                             "hier3 = 3-layer multimodal hierarchical (L1 action / L2 object / L3 context) with contrastive projections (V4); "
+                             "clip_film = CLIP text + FiLM-conditioned ResNet-18 visual, 3-layer hierarchy (V4 multimodal)")
+    parser.add_argument("--verb_weight", type=float, default=3.0,
+                        help="[verb_aware only] Scale for verb one-hot in s_goal")
+    parser.add_argument("--verb_token_boost", type=float, default=5.0,
+                        help="[verb_aware only] Pooling weight multiplier for verb tokens")
+    parser.add_argument("--hidden_layer", type=int, default=-1,
+                        help="Transformer layer to pool hidden states from. "
+                             "-1=last, 0=embedding output, 12=early, 18=mid, 36=last.")
+    parser.add_argument("--no_hidden_states", action="store_true",
+                        help="[verb_aware only] Use raw input embeddings instead of hidden states")
+    # ---- SentenceEncoder-specific args ----
+    parser.add_argument("--pool_mode", type=str, default="last_token",
+                        choices=["last_token", "sif", "mean", "hybrid"],
+                        help="[sentence only] Pooling strategy: "
+                             "last_token = last non-padding hidden state (best default); "
+                             "sif = Smooth Inverse Frequency weighted mean-pool; "
+                             "mean = plain hidden-state mean-pool; "
+                             "hybrid = concat(last_token, sif)")
+    parser.add_argument("--sif_alpha", type=float, default=1e-3,
+                        help="[sentence, sif/hybrid] SIF smoothing parameter")
+    parser.add_argument("--no_remove_pc", action="store_true",
+                        help="[sentence, sif/hybrid] Skip first-PC removal")
+    parser.add_argument("--prompt_prefix", type=str, default="Skill: ",
+                        help="[sentence only] Text prefix prepended to each subtask for encoding")
+    parser.add_argument("--hybrid_weight", type=float, default=0.5,
+                        help="[sentence, hybrid] Weight for last_token stream (0-1)")
+    # ---- SBERTEncoder-specific args ----
+    parser.add_argument("--sbert_model", type=str, default="all-MiniLM-L6-v2",
+                        help="[sbert only] Sentence-transformer model name or path. "
+                             "Recommended: all-MiniLM-L6-v2 (22M, 384d, fast), "
+                             "all-mpnet-base-v2 (110M, 768d, best quality)")
+    parser.add_argument("--verb_boost", type=float, default=0.0,
+                        help="[sbert only] Weight for concatenated verb-phrase embedding. "
+                             "0 = off (pure semantic), 0.5-1.0 = amplify verb signal. "
+                             "Helps separate 'Move to X' vs 'Pick up X' on same object.")
+    # ---- OATEncoder-specific args ----
+    parser.add_argument("--oat_action_weight", type=float, default=4.0,
+                        help="[oat only] Scale for action one-hot in embedding. "
+                             "Higher = stronger first-level verb separation (default: 4.0)")
+    parser.add_argument("--oat_handling_weight", type=float, default=2.0,
+                        help="[oat only] Scale for object handling-style one-hot. "
+                             "Controls 轻拿轻放 vs 随便拿 separation (default: 2.0)")
+    parser.add_argument("--oat_target_type_weight", type=float, default=1.0,
+                        help="[oat only] Scale for target-type one-hot (default: 1.0)")
+    parser.add_argument("--oat_object_weight", type=float, default=1.0,
+                        help="[oat only] Scale for object semantic embedding (default: 1.0)")
+    parser.add_argument("--oat_target_weight", type=float, default=0.5,
+                        help="[oat only] Scale for target semantic embedding (default: 0.5)")
+    parser.add_argument("--prompt_version", type=str, default="v1",
+                        choices=["v1", "v2"],
+                        help="Planner prompt version: "
+                             "v1 = strict 7-verb vocabulary; "
+                             "v2 = open verb vocabulary (recommended with sentence encoder)")
+    parser.add_argument("--subtasks_cache", type=str, default=None,
+                        help="Path to a cached subtask JSON file. "
+                             "If omitted, auto-detects tmp/<suite>_subtasks.json. "
+                             "Pass '--subtasks_cache none' to force re-run.")
+    parser.add_argument("--save_task_artifacts", action="store_true",
+                        help="Save per-task images and subtasks to output_dir/task_artifacts/")
+    parser.add_argument("--obs_subtask_source", type=str, default="env",
+                        choices=["env", "saved", "auto"],
+                        help="Source of task images + subtasks: "
+                             "env=always query env/planner/cache, "
+                             "saved=only read from saved task_artifacts, "
+                             "auto=try saved first then fallback to env")
+    parser.add_argument("--task_artifacts_dir", type=str, default=None,
+                        help="Directory containing task_artifacts/task_XXX/*. "
+                             "Defaults to <output_dir>/task_artifacts")
+
+    # ---- segmented skill embedding (three-segment: action / object / context) ---
+    parser.add_argument("--segmented", action="store_true",
+                        help="Build three-segment compressed skill embeddings "
+                             "(s_action|s_object|s_context) with random projection.")
+    parser.add_argument("--d_action", type=int, default=16,
+                        help="Dimension of action segment (default: 16)")
+    parser.add_argument("--d_object", type=int, default=40,
+                        help="Dimension of object segment (default: 40)")
+    parser.add_argument("--d_context", type=int, default=32,
+                        help="Dimension of context/env segment (default: 32)")
+    parser.add_argument("--seg_seed", type=int, default=42,
+                        help="Random seed for projection matrices (default: 42)")
+    # ---- hier3 (3-layer hierarchical) args ----
+    parser.add_argument("--dist_threshold_object", type=float, default=0.5,
+                        help="[hier3] L2 distance threshold for object clustering (default: 0.5)")
+    parser.add_argument("--dist_threshold_context", type=float, default=0.6,
+                        help="[hier3] L3 distance threshold for context clustering (default: 0.6)")
+    parser.add_argument("--use_contrastive_proj", action="store_true",
+                        help="[hier3] Load learned contrastive projections from --contrastive_dir")
+    parser.add_argument("--contrastive_dir", type=str, default="skill_lib_results_contrastive",
+                        help="[hier3] Directory with proj_*.pt from build_contrastive_skill_emb.py")
+    parser.add_argument("--vl_describe", action="store_true",
+                        help="[hier3] Use VLM to generate visual object descriptions for richer s_o")
+    # ---- clip_film encoder args ----
+    parser.add_argument("--clip_model", type=str,
+                        default="openai/clip-vit-base-patch32",
+                        help="[clip_film] HuggingFace CLIP model name/path. "
+                             "E.g. openai/clip-vit-base-patch32 (512d, fast), "
+                             "openai/clip-vit-large-patch14 (768d, best quality)")
+    parser.add_argument("--no_pretrained_resnet", action="store_true",
+                        help="[clip_film] Start ResNet-18 from scratch (not recommended)")
+    parser.add_argument("--clip_film_batch", type=int, default=32,
+                        help="[clip_film] Per-batch size for CLIP+FiLM encoding (default: 32)")
+    parser.add_argument("--clip_film_device", type=str, default=None,
+                        help="[clip_film] Device for CLIP+FiLM inference, "
+                             "defaults to --device value")
+    parser.add_argument("--reuse_clip_segs", action="store_true",
+                        help="[clip_film] Skip CLIP encoding, reuse saved seg_*.npy from output_dir")
+    parser.add_argument("--clip_film_dir", type=str, default=None,
+                        help="[clip_film] Directory containing trained clip_film_encoder.pt "
+                             "and/or seg_*.npy to reuse (defaults to output_dir)")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    task_artifacts_dir = Path(args.task_artifacts_dir) if args.task_artifacts_dir else (output_dir / "task_artifacts")
+
+    # ---- load benchmark ----
+    task_suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
+    n_tasks = task_suite.n_tasks
+    if args.max_tasks is not None:
+        n_tasks = min(n_tasks, args.max_tasks)
+    print(f"[Info] Processing {n_tasks} tasks from '{args.task_suite_name}'")
+
+    bddl_root = Path(get_libero_path("bddl_files"))
+
+    # ---- determine cache path ----
+    _DEFAULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    auto_cache = _DEFAULT_CACHE_DIR / f"{args.task_suite_name}_subtasks.json"
+    if args.subtasks_cache is None:
+        cache_path = auto_cache if auto_cache.exists() else None
+    elif args.subtasks_cache.lower() == "none":
+        cache_path = None          # force re-run
+    else:
+        cache_path = Path(args.subtasks_cache)
+
+    all_subtask_texts: list[str] = []
+    all_task_ids: list[int] = []
+    task_languages: list[str] = []
+    task_env_embeddings: list[np.ndarray] = []  # one s_env per task
+    obs_structure_dump: dict[str, Any] | None = None
+
+    # ---- load planner (needed for subtask generation and Qwen text embedding) ----
+    print(f"[Info] Loading QwenPlanner from {args.model_path}")
+    planner = QwenPlanner(
+        model_path=args.model_path,
+        device=args.device,
+        prompt_version=args.prompt_version,
+    )
+
+    loaded_from_saved = False
+    if args.obs_subtask_source in ("saved", "auto"):
+        print(f"[Info] Trying to load images+subtasks from saved artifacts: {task_artifacts_dir}")
+        try:
+            for task_id in range(n_tasks):
+                task = task_suite.get_task(task_id)
+                main_img, wrist_img, subtasks, task_lang_saved = load_task_artifacts(
+                    task_artifacts_dir=task_artifacts_dir,
+                    task_id=task_id,
+                )
+
+                task_lang = task_lang_saved or task.language
+                task_languages.append(task_lang)
+
+                for st in subtasks:
+                    all_subtask_texts.append(st)
+                    all_task_ids.append(task_id)
+
+                s_env = planner.encode_env_state(
+                    image_list=[main_img, wrist_img],
+                    prompt=f"Current environment for task: {task_lang}",
+                )
+                task_env_embeddings.append(s_env)
+
+            loaded_from_saved = True
+            print(f"[Info] Loaded all {n_tasks} tasks from saved artifacts.")
+        except Exception as exc:
+            if args.obs_subtask_source == "saved":
+                raise RuntimeError(
+                    f"Failed to load from saved artifacts only mode: {exc}"
+                ) from exc
+            print(f"[Warn] saved artifacts not fully usable ({exc}); fallback to env source.")
+            all_subtask_texts = []
+            all_task_ids = []
+            task_languages = []
+            task_env_embeddings = []
+
+    if not loaded_from_saved and cache_path is not None and cache_path.exists():
+        # ---- load subtasks from cache (skip planner) ----
+        print(f"[Info] Loading subtasks from cache: {cache_path}")
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        all_subtask_texts = cached["texts"]
+        all_task_ids      = cached["task_ids"]
+        task_languages    = cached["task_languages"]
+        # only keep tasks within n_tasks limit
+        if args.max_tasks is not None:
+            keep = [i for i, tid in enumerate(all_task_ids) if tid < n_tasks]
+            all_subtask_texts = [all_subtask_texts[i] for i in keep]
+            all_task_ids      = [all_task_ids[i]      for i in keep]
+            task_languages    = task_languages[:n_tasks]
+        print(f"[Info] Loaded {len(all_subtask_texts)} subtasks for "
+              f"{len(set(all_task_ids))} tasks from cache.")
+
+        subtasks_by_task: dict[int, list[str]] = {}
+        for text, tid in zip(all_subtask_texts, all_task_ids):
+            if tid not in subtasks_by_task:
+                subtasks_by_task[tid] = []
+            subtasks_by_task[tid].append(text)
+
+        # Even when subtasks are cached, we still build real-time s_env from obs.
+        print("[Info] Building real-time s_env embeddings from current observations …")
+        for task_id in range(n_tasks):
+            task = task_suite.get_task(task_id)
+            if task_id >= len(task_languages):
+                task_languages.append(task.language)
+            task_bddl_file = bddl_root / task.problem_folder / task.bddl_file
+
+            if args.no_render:
+                blank = np.zeros((256, 256, 3), dtype=np.uint8)
+                main_img, wrist_img = blank, blank
+            else:
+                try:
+                    env = build_env(task_bddl_file, args.seed)
+                    init_states = task_suite.get_task_init_states(task_id)
+                    obs = get_initial_obs(env, init_states[0])
+                    if obs_structure_dump is None:
+                        obs_structure_dump = parse_obs_structure(obs)
+                    main_img, wrist_img = obs_to_images(obs)
+                    env.close()
+                    del env
+                    gc.collect()
+                except Exception as exc:
+                    print(f"  [Warn] env failed for task {task_id} ({exc}); using blank images")
+                    blank = np.zeros((256, 256, 3), dtype=np.uint8)
+                    main_img, wrist_img = blank, blank
+
+            s_env = planner.encode_env_state(
+                image_list=[main_img, wrist_img],
+                prompt=f"Current environment for task: {task.language}",
+            )
+            task_env_embeddings.append(s_env)
+
+            if args.save_task_artifacts:
+                save_task_artifacts(
+                    output_dir=output_dir,
+                    task_id=task_id,
+                    task_language=task.language,
+                    main_img=main_img,
+                    wrist_img=wrist_img,
+                    subtasks=subtasks_by_task.get(task_id, []),
+                )
+    elif not loaded_from_saved:
+        # ---- run planner for subtask generation ----
+        for task_id in range(n_tasks):
+            task = task_suite.get_task(task_id)
+            task_lang = task.language
+            task_languages.append(task_lang)
+            task_bddl_file = bddl_root / task.problem_folder / task.bddl_file
+
+            print(f"\n[Task {task_id:3d}/{n_tasks}] {task_lang}")
+
+            if args.no_render:
+                blank = np.zeros((256, 256, 3), dtype=np.uint8)
+                main_img, wrist_img = blank, blank
+            else:
+                try:
+                    env = build_env(task_bddl_file, args.seed)
+                    init_states = task_suite.get_task_init_states(task_id)
+                    obs = get_initial_obs(env, init_states[0])
+                    if obs_structure_dump is None:
+                        obs_structure_dump = parse_obs_structure(obs)
+                    main_img, wrist_img = obs_to_images(obs)
+                    env.close()
+                    del env
+                    gc.collect()
+                except Exception as exc:
+                    print(f"  [Warn] env failed ({exc}); using blank images")
+                    blank = np.zeros((256, 256, 3), dtype=np.uint8)
+                    main_img, wrist_img = blank, blank
+
+            subtasks = planner.get_subtasks(
+                high_task=task_lang,
+                image_list=[main_img, wrist_img],
+                max_new_tokens=256,
+                temperature=0.0,
+                do_sample=False,
+            )
+
+            if not subtasks:
+                print("  [Warn] planner returned empty list; skipping task")
+                # still keep one env vector for indexing consistency
+                s_env = planner.encode_env_state(
+                    image_list=[main_img, wrist_img],
+                    prompt=f"Current environment for task: {task_lang}",
+                )
+                task_env_embeddings.append(s_env)
+                continue
+
+            print(f"  → {len(subtasks)} subtasks:")
+            for i, st in enumerate(subtasks, 1):
+                print(f"     {i}. {st}")
+
+            for st in subtasks:
+                all_subtask_texts.append(st)
+                all_task_ids.append(task_id)
+
+            s_env = planner.encode_env_state(
+                image_list=[main_img, wrist_img],
+                prompt=f"Current environment for task: {task_lang}",
+            )
+            task_env_embeddings.append(s_env)
+
+            if args.save_task_artifacts:
+                save_task_artifacts(
+                    output_dir=output_dir,
+                    task_id=task_id,
+                    task_language=task_lang,
+                    main_img=main_img,
+                    wrist_img=wrist_img,
+                    subtasks=subtasks,
+                )
+
+        # ---- persist subtasks to tmp/ cache ----
+        cache_data = {
+            "task_suite_name": args.task_suite_name,
+            "texts": all_subtask_texts,
+            "task_ids": all_task_ids,
+            "task_languages": task_languages,
+        }
+        auto_cache.write_text(
+            json.dumps(cache_data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"[Info] Subtasks cached → {auto_cache}")
+
+    # ---- save grouped subtasks by task for easy later reuse ----
+    subtasks_grouped: dict[int, dict[str, Any]] = {}
+    for st, tid in zip(all_subtask_texts, all_task_ids):
+        if tid not in subtasks_grouped:
+            subtasks_grouped[tid] = {
+                "task_id": tid,
+                "task_language": task_languages[tid],
+                "subtasks": [],
+            }
+        subtasks_grouped[tid]["subtasks"].append(st)
+    grouped_list = [subtasks_grouped[tid] for tid in sorted(subtasks_grouped)]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "subtasks_by_task.json").write_text(
+        json.dumps(grouped_list, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"[Info] Grouped subtasks saved → {output_dir / 'subtasks_by_task.json'}")
+
+    if not all_subtask_texts:
+        print("[Error] No subtasks collected. Exiting.")
+        return
+
+    print(f"\n[Info] Total subtasks collected: {len(all_subtask_texts)}")
+    if len(task_env_embeddings) != n_tasks:
+        # Fallback to blanks if any task failed before appending.
+        print(f"[Warn] task_env_embeddings count={len(task_env_embeddings)} != n_tasks={n_tasks}; padding.")
+        if len(task_env_embeddings) == 0:
+            raise RuntimeError("No s_env embeddings collected.")
+        while len(task_env_embeddings) < n_tasks:
+            task_env_embeddings.append(task_env_embeddings[-1].copy())
+
+    # ---- Encode s_goal ----
+    if args.encoder_mode == "naive":
+        print("[Info] Encoding subtasks with NAIVE encoder (mean-pool input embeddings) …")
+        encoder = NaiveTextEncoder(planner=planner)
+    elif args.encoder_mode == "verb_aware":
+        print("[Info] Encoding subtasks with VERB-AWARE encoder …")
+        encoder = QwenTextEncoder(
+            planner=planner,
+            verb_weight=args.verb_weight,
+            verb_token_boost=args.verb_token_boost,
+            use_hidden_states=not args.no_hidden_states,
+            hidden_layer=args.hidden_layer,
+        )
+    elif args.encoder_mode == "sbert":
+        print(f"[Info] Encoding subtasks with SBERT encoder ({args.sbert_model}) …")
+        encoder = SBERTEncoder(
+            sbert_model=args.sbert_model,
+            prompt_prefix=args.prompt_prefix,
+            device="cpu",
+            verb_boost=args.verb_boost,
+        )
+    elif args.encoder_mode == "oat":
+        print(f"[Info] Encoding subtasks with OAT encoder ({args.sbert_model}) …")
+        encoder = OATEncoder(
+            sbert_model=args.sbert_model,
+            device="cpu",
+            action_weight=args.oat_action_weight,
+            handling_weight=args.oat_handling_weight,
+            target_type_weight=args.oat_target_type_weight,
+            object_weight=args.oat_object_weight,
+            target_weight=args.oat_target_weight,
+        )
+    elif args.encoder_mode == "verbnet":
+        print(f"[Info] Encoding subtasks with VerbNet-compatible SENTENCE encoder (pool={args.pool_mode}) …")
+        encoder = SentenceEncoder(
+            planner=planner,
+            pool_mode=args.pool_mode,
+            hidden_layer=args.hidden_layer,
+            sif_alpha=args.sif_alpha,
+            remove_pc=not args.no_remove_pc,
+            prompt_prefix=args.prompt_prefix,
+            hybrid_weight=args.hybrid_weight,
+        )
+    else:
+        print(f"[Info] Encoding subtasks with SENTENCE encoder (pool={args.pool_mode}) …")
+        encoder = SentenceEncoder(
+            planner=planner,
+            pool_mode=args.pool_mode,
+            hidden_layer=args.hidden_layer,
+            sif_alpha=args.sif_alpha,
+            remove_pc=not args.no_remove_pc,
+            prompt_prefix=args.prompt_prefix,
+            hybrid_weight=args.hybrid_weight,
+        )
+    s_goal = encoder.encode(all_subtask_texts)
+    s_env_task = np.stack(task_env_embeddings, axis=0).astype(np.float32)
+
+    embeddings = build_skill_index_embeddings(
+        s_goal=s_goal,
+        s_env=s_env_task,
+        task_ids=all_task_ids,
+        mode=args.cluster_index,
+        goal_weight=args.goal_weight,
+        env_weight=args.env_weight,
+    )
+    print(f"[Info] s_goal matrix: {s_goal.shape}")
+    print(f"[Info] s_env(task) matrix: {s_env_task.shape}")
+    print(f"[Info] skill index embedding matrix ({args.cluster_index}): {embeddings.shape}")
+
+    # ---- save raw data before clustering (checkpoint) ----
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.save(output_dir / "subtask_embeddings.npy", embeddings)
+    np.save(output_dir / "s_goal_embeddings.npy", s_goal)
+    np.save(output_dir / "s_env_embeddings.npy", s_env_task)
+    (output_dir / "subtask_texts.json").write_text(
+        json.dumps(
+            {
+                "texts": all_subtask_texts,
+                "task_ids": all_task_ids,
+                "task_languages": task_languages,
+                "cluster_index": args.cluster_index,
+                "goal_weight": args.goal_weight,
+                "env_weight": args.env_weight,
+            },
+            indent=2, ensure_ascii=False
+        ),
+        encoding="utf-8",
+    )
+    if obs_structure_dump is not None:
+        (output_dir / "obs_structure.json").write_text(
+            json.dumps(obs_structure_dump, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"[Info] Parsed LIBERO obs structure saved → {output_dir / 'obs_structure.json'}")
+    print(f"[Info] Raw embeddings & texts saved to {output_dir}/")
+
+    # ---- segmented skill embedding (optional) ----
+    if args.segmented:
+        seg_result = build_segmented_skill_embeddings(
+            subtask_texts=all_subtask_texts,
+            task_ids=all_task_ids,
+            s_env=s_env_task,
+            sbert_model=args.sbert_model,
+            d_action=args.d_action,
+            d_object=args.d_object,
+            d_context=args.d_context,
+            seed=args.seg_seed,
+        )
+        # Override embeddings for downstream clustering
+        embeddings = seg_result["embeddings"]
+        # Save segment data
+        np.save(output_dir / "seg_action.npy", seg_result["s_action"])
+        np.save(output_dir / "seg_object.npy", seg_result["s_object"])
+        np.save(output_dir / "seg_context.npy", seg_result["s_context"])
+        np.save(output_dir / "seg_embeddings.npy", embeddings)
+        np.save(output_dir / "proj_action.npy", seg_result["proj_action"])
+        np.save(output_dir / "proj_object.npy", seg_result["proj_object"])
+        np.save(output_dir / "proj_context.npy", seg_result["proj_context"])
+        (output_dir / "segment_info.json").write_text(
+            json.dumps({
+                "segment_dims": seg_result["segment_dims"],
+                "action_texts": seg_result["action_texts"],
+                "object_texts": seg_result["object_texts"],
+                "sbert_model": args.sbert_model,
+                "seed": args.seg_seed,
+            }, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        # Also overwrite subtask_embeddings.npy with the compressed version
+        np.save(output_dir / "subtask_embeddings.npy", embeddings)
+        print(f"[Segmented] Segment data saved to {output_dir}/")
+
+    # ---- clustering & visualisation ----
+    if args.encoder_mode == "clip_film":
+        # ---- V4: CLIP text + FiLM-conditioned ResNet-18 visual ----
+
+        # Check if we can reuse saved seg files
+        # Prefer --clip_film_dir if given, otherwise fall back to output_dir
+        _clip_film_src = Path(args.clip_film_dir) if args.clip_film_dir else output_dir
+        _seg_a_path = _clip_film_src / "seg_action.npy"
+        _seg_o_path = _clip_film_src / "seg_object.npy"
+        _seg_c_path = _clip_film_src / "seg_context.npy"
+        _can_reuse = (args.reuse_clip_segs
+                      and _seg_a_path.exists()
+                      and _seg_o_path.exists()
+                      and _seg_c_path.exists())
+
+        if _can_reuse:
+            print("[ClipFilm] Reusing saved seg_*.npy (--reuse_clip_segs)")
+            seg_a = np.load(_seg_a_path).astype(np.float32)
+            seg_o = np.load(_seg_o_path).astype(np.float32)
+            seg_c = np.load(_seg_c_path).astype(np.float32)
+            print(f"[ClipFilm] Loaded: s_a{seg_a.shape}, s_o{seg_o.shape}, s_c{seg_c.shape}")
+        else:
+            # Use importlib to avoid conflict with site-packages libero
+            import importlib.util as _ilu
+            _film_spec = _ilu.spec_from_file_location(
+                "film_encoder",
+                str(Path(__file__).resolve().parent / "film_encoder.py"),
+            )
+            _film_mod = _ilu.module_from_spec(_film_spec)
+            _film_spec.loader.exec_module(_film_mod)
+            CLIPFiLMSkillEncoder = _film_mod.CLIPFiLMSkillEncoder
+            _film_preprocess = _film_mod.preprocess_images
+
+            _film_device = args.clip_film_device or args.device
+            _pretrained_resnet = not args.no_pretrained_resnet
+
+            print(f"[ClipFilm] Loading CLIP model: {args.clip_model}")
+            _encoder = CLIPFiLMSkillEncoder(
+                clip_model_name=args.clip_model,
+                d_action=args.d_action,
+                d_object=args.d_object,
+                d_context=args.d_context,
+                pretrained_resnet=_pretrained_resnet,
+                freeze_clip=True,
+            ).to(_film_device)
+            _encoder.eval()
+
+            # Optional: load learned projections + FiLM weights
+            if args.use_contrastive_proj:
+                import torch as _torch
+                _cdir = Path(args.contrastive_dir)
+                _ckpt = _cdir / "clip_film_encoder.pt"
+                if _ckpt.exists():
+                    _encoder.load_state_dict(
+                        _torch.load(_ckpt, map_location=_film_device, weights_only=True),
+                        strict=False,
+                    )
+                    print(f"[ClipFilm] Loaded trained weights from {_ckpt}")
+                else:
+                    print(f"[ClipFilm] WARNING: {_ckpt} not found, using identity FiLM (untrained)")
+
+            # Parse each subtask into action/object phrase
+            _action_texts, _object_texts = [], []
+            for _t in all_subtask_texts:
+                _p = _parse_subtask_verbnet(_t)
+                _action_texts.append(_p["verb_phrase"] or _t)
+                _object_texts.append(_p["object_phrase"] or "object")
+
+            # Batch-encode with CLIP + FiLM-ResNet (per-subtask scene image)
+            print(f"[ClipFilm] Encoding {len(all_subtask_texts)} subtasks "
+                  f"with CLIP+FiLM-ResNet on {_film_device} ...")
+            seg_a_list, seg_o_list, seg_c_list = [], [], []
+            _bs = args.clip_film_batch
+            for _i in range(0, len(all_subtask_texts), _bs):
+                _end = min(_i + _bs, len(all_subtask_texts))
+                _batch_a   = _action_texts[_i:_end]
+                _batch_o   = _object_texts[_i:_end]
+                _batch_f   = all_subtask_texts[_i:_end]
+                _batch_ids = all_task_ids[_i:_end]
+
+                # Load per-subtask scene image (initial task observation)
+                _batch_imgs = []
+                for _tid in _batch_ids:
+                    try:
+                        _m, _, _, _ = load_task_artifacts(task_artifacts_dir, _tid)
+                        _batch_imgs.append(_m)
+                    except Exception:
+                        _batch_imgs.append(np.zeros((256, 256, 3), dtype=np.uint8))
+
+                _out = _encoder.forward_numpy(
+                    action_texts=_batch_a,
+                    object_texts=_batch_o,
+                    full_texts=_batch_f,
+                    images=_batch_imgs,
+                    device=_film_device,
+                )
+                seg_a_list.append(_out["s_a"])
+                seg_o_list.append(_out["s_o"])
+                seg_c_list.append(_out["s_c"])
+
+            seg_a = np.concatenate(seg_a_list, axis=0).astype(np.float32)
+            seg_o = np.concatenate(seg_o_list, axis=0).astype(np.float32)
+            seg_c = np.concatenate(seg_c_list, axis=0).astype(np.float32)
+            del _encoder
+
+            print(f"[ClipFilm] Segments: s_a{seg_a.shape}, s_o{seg_o.shape}, s_c{seg_c.shape}")
+
+            # Save segments
+            np.save(output_dir / "seg_action.npy",    seg_a)
+            np.save(output_dir / "seg_object.npy",    seg_o)
+            np.save(output_dir / "seg_context.npy",   seg_c)
+            np.save(output_dir / "seg_embeddings.npy",
+                    np.concatenate([seg_a, seg_o, seg_c], axis=1))
+
+            (output_dir / "segment_info.json").write_text(
+                json.dumps({
+                    "encoder": "clip_film",
+                    "clip_model": args.clip_model,
+                    "pretrained_resnet": _pretrained_resnet,
+                    "d_action": args.d_action,
+                    "d_object": args.d_object,
+                    "d_context": args.d_context,
+                    "total_dim": args.d_action + args.d_object + args.d_context,
+                    "film_note": "FiLM identity-init (gamma=1,beta=0) unless --use_contrastive_proj",
+                }, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        # Build 3-layer hierarchical library
+        build_3layer_hierarchical_library(
+            subtask_texts=all_subtask_texts,
+            task_ids=all_task_ids,
+            s_action=seg_a,
+            s_object=seg_o,
+            s_context=seg_c,
+            dist_threshold_object=args.dist_threshold_object,
+            dist_threshold_context=args.dist_threshold_context,
+            output_dir=output_dir,
+            task_languages=task_languages,
+        )
+
+    elif args.encoder_mode == "hier3":
+        # ---- 3-layer multimodal hierarchical (V4) ----
+        from sklearn.preprocessing import normalize as _normalize
+
+        # Parse subtasks into action/object phrases
+        _action_texts, _object_texts, _vn_classes = [], [], []
+        for _t in all_subtask_texts:
+            _p = _parse_subtask_verbnet(_t)
+            _action_texts.append(_p["verb_phrase"])
+            _object_texts.append(_p["object_phrase"] or "object")
+            _vn_classes.append(_p["verbnet_class"])
+
+        # Optional VLM visual descriptions for object phrases
+        _vl_descs = None
+        if args.vl_describe:
+            print("[Hier3] Generating VLM visual descriptions for object phrases …")
+            _vl_descs = []
+            _desc_cache: dict[str, str] = {}
+            for i, _t in enumerate(all_subtask_texts):
+                _obj = _object_texts[i]
+                _tid = all_task_ids[i]
+                _key = f"{_tid}:{_obj}"
+                if _key in _desc_cache:
+                    _vl_descs.append(_desc_cache[_key])
+                    continue
+                # Load images for this task
+                try:
+                    _m, _w, _, _ = load_task_artifacts(task_artifacts_dir, _tid)
+                    desc = planner.describe_object(_obj, [_m, _w])
+                except Exception:
+                    desc = _obj
+                _desc_cache[_key] = desc
+                _vl_descs.append(desc)
+            # Use VLM descriptions instead of bare noun phrases for encoding
+            _object_texts = _vl_descs
+            print(f"[Hier3] Generated {len(_desc_cache)} unique descriptions.")
+
+        # Encode segments with SBERT
+        from sentence_transformers import SentenceTransformer as _ST
+        _sbert = _ST(args.sbert_model, device="cpu")
+        _act_raw = _sbert.encode(_action_texts, batch_size=128, show_progress_bar=False,
+                                 convert_to_numpy=True, normalize_embeddings=False).astype(np.float32)
+        _obj_raw = _sbert.encode(_object_texts, batch_size=128, show_progress_bar=False,
+                                 convert_to_numpy=True, normalize_embeddings=False).astype(np.float32)
+        _ctx_raw = s_env_task[np.array(all_task_ids, dtype=np.int64)]
+        del _sbert
+
+        # Apply projections
+        if args.use_contrastive_proj:
+            import torch as _torch
+            from Skill_Lib.build_contrastive_skill_emb import Projector as _Proj
+            _cdir = Path(args.contrastive_dir)
+            _D_sbert = _act_raw.shape[1]
+            _D_env = _ctx_raw.shape[1]
+
+            def _load_proj(fname, d_in, d_out):
+                p = _Proj(d_in, d_out)
+                p.load_state_dict(_torch.load(_cdir / fname, map_location="cpu", weights_only=True))
+                p.eval()
+                return p
+
+            _pa = _load_proj("proj_action.pt", _D_sbert, args.d_action)
+            _po = _load_proj("proj_object.pt", _D_sbert, args.d_object)
+            _pc = _load_proj("proj_context.pt", _D_env, args.d_context)
+            with _torch.no_grad():
+                seg_a = _pa(_torch.from_numpy(_normalize(_act_raw))).numpy()
+                seg_o = _po(_torch.from_numpy(_normalize(_obj_raw))).numpy()
+                seg_c = _pc(_torch.from_numpy(_normalize(_ctx_raw))).numpy()
+            print(f"[Hier3] Applied contrastive projections from {_cdir}")
+        else:
+            # Random projection fallback
+            _pA = _random_projection_matrix(_act_raw.shape[1], args.d_action, seed=args.seg_seed)
+            _pO = _random_projection_matrix(_obj_raw.shape[1], args.d_object, seed=args.seg_seed + 1)
+            _pC = _random_projection_matrix(_ctx_raw.shape[1], args.d_context, seed=args.seg_seed + 2)
+            seg_a = (_normalize(_act_raw) @ _pA.T)
+            seg_o = (_normalize(_obj_raw) @ _pO.T)
+            seg_c = (_normalize(_ctx_raw) @ _pC.T)
+            np.save(output_dir / "proj_action.npy", _pA)
+            np.save(output_dir / "proj_object.npy", _pO)
+            np.save(output_dir / "proj_context.npy", _pC)
+
+        # Save segments
+        np.save(output_dir / "seg_action.npy", seg_a)
+        np.save(output_dir / "seg_object.npy", seg_o)
+        np.save(output_dir / "seg_context.npy", seg_c)
+        np.save(output_dir / "seg_embeddings.npy", np.concatenate([seg_a, seg_o, seg_c], axis=1))
+
+        if _vl_descs is not None:
+            (output_dir / "vl_object_descriptions.json").write_text(
+                json.dumps(_vl_descs, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+
+        # Build and save library
+        build_3layer_hierarchical_library(
+            subtask_texts=all_subtask_texts,
+            task_ids=all_task_ids,
+            s_action=seg_a,
+            s_object=seg_o,
+            s_context=seg_c,
+            dist_threshold_object=args.dist_threshold_object,
+            dist_threshold_context=args.dist_threshold_context,
+            output_dir=output_dir,
+            task_languages=task_languages,
+            vl_descriptions=_vl_descs,
+        )
+    elif args.encoder_mode == "segmented_hier":
+        segmented_hierarchical_cluster(
+            subtask_texts=all_subtask_texts,
+            task_ids=all_task_ids,
+            seg_result=seg_result,
+            dist_threshold=args.dist_threshold,
+            output_dir=output_dir,
+            task_languages=task_languages,
+        )
+    elif args.encoder_mode == "oat":
+        oat_hierarchical_cluster(
+            subtask_texts=all_subtask_texts,
+            task_ids=all_task_ids,
+            embeddings=embeddings,
+            dist_threshold=args.dist_threshold,
+            output_dir=output_dir,
+            task_languages=task_languages,
+        )
+    elif args.encoder_mode == "verbnet":
+        verbnet_hierarchical_cluster(
+            subtask_texts=all_subtask_texts,
+            task_ids=all_task_ids,
+            embeddings=embeddings,
+            dist_threshold=args.dist_threshold,
+            output_dir=output_dir,
+            task_languages=task_languages,
+        )
+    else:
+        cluster_and_visualise(
+            subtask_texts=all_subtask_texts,
+            task_ids=all_task_ids,
+            embeddings=embeddings,
+            dist_threshold=args.dist_threshold,
+            output_dir=output_dir,
+            task_languages=task_languages,
+        )
+
+    print("\n[Done] All outputs written to:", output_dir.resolve())
+
+
+if __name__ == "__main__":
+    main()

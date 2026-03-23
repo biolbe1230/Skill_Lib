@@ -1,0 +1,7 @@
+skill_lib*
+eval_results*
+eval_videos
+checkpoints
+act_ckpts
+tmp
+.git_backup_*

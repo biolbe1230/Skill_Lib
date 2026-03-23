@@ -1,0 +1,1 @@
+python Skill_Lib/test_skill_lib.py     --dist_threshold 0.6     --output_dir skill_lib_results
