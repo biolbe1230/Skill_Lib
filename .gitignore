@@ -1,3 +1,5 @@
+__pycache__/
+*.pyc
 skill_lib*
 eval_results*
 eval_videos
